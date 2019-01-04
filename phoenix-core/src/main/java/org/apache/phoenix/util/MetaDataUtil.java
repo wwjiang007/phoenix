@@ -21,20 +21,25 @@ import static org.apache.phoenix.util.SchemaUtil.getVarChars;
 
 import java.io.IOException;
 import java.sql.SQLException;
-import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.NavigableMap;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
+import org.apache.hadoop.hbase.CellUtil;
+import org.apache.hadoop.hbase.ExtendedCell;
+import org.apache.hadoop.hbase.ExtendedCellBuilder;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.ServerName;
+import org.apache.hadoop.hbase.TagUtil;
 import org.apache.hadoop.hbase.client.ClusterConnection;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptor;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
@@ -52,6 +57,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.AdminServic
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.phoenix.coprocessor.MetaDataProtocol;
+import org.apache.phoenix.hbase.index.util.GenericKeyValueBuilder;
 import org.apache.phoenix.hbase.index.util.ImmutableBytesPtr;
 import org.apache.phoenix.hbase.index.util.IndexManagementUtil;
 import org.apache.phoenix.hbase.index.util.KeyValueBuilder;
@@ -80,6 +86,7 @@ import org.apache.phoenix.schema.types.PUnsignedTinyint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 
@@ -93,8 +100,22 @@ public class MetaDataUtil {
     public static final byte[] VIEW_INDEX_SEQUENCE_PREFIX_BYTES = Bytes.toBytes(VIEW_INDEX_SEQUENCE_PREFIX);
     private static final String VIEW_INDEX_ID_COLUMN_NAME = "_INDEX_ID";
     public static final String PARENT_TABLE_KEY = "PARENT_TABLE";
-    public static final byte[] PARENT_TABLE_KEY_BYTES = Bytes.toBytes("PARENT_TABLE");
-    
+    public static final String IS_VIEW_INDEX_TABLE_PROP_NAME = "IS_VIEW_INDEX_TABLE";
+    public static final byte[] IS_VIEW_INDEX_TABLE_PROP_BYTES = Bytes.toBytes(IS_VIEW_INDEX_TABLE_PROP_NAME);
+
+    public static final String IS_LOCAL_INDEX_TABLE_PROP_NAME = "IS_LOCAL_INDEX_TABLE";
+    public static final byte[] IS_LOCAL_INDEX_TABLE_PROP_BYTES = Bytes.toBytes(IS_LOCAL_INDEX_TABLE_PROP_NAME);
+
+    public static final String DATA_TABLE_NAME_PROP_NAME = "DATA_TABLE_NAME";
+
+    public static final byte[] DATA_TABLE_NAME_PROP_BYTES = Bytes.toBytes(DATA_TABLE_NAME_PROP_NAME);
+
+    // See PHOENIX-3955
+    public static final List<String> SYNCED_DATA_TABLE_AND_INDEX_COL_FAM_PROPERTIES = ImmutableList.of(
+            ColumnFamilyDescriptorBuilder.TTL,
+            ColumnFamilyDescriptorBuilder.KEEP_DELETED_CELLS,
+            ColumnFamilyDescriptorBuilder.REPLICATION_SCOPE);
+
     public static boolean areClientAndServerCompatible(long serverHBaseAndPhoenixVersion) {
         // As of 3.0, we allow a client and server to differ for the minor version.
         // Care has to be taken to upgrade the server before the client, as otherwise
@@ -228,9 +249,54 @@ public class MetaDataUtil {
                     Cell replacementCell = new KeyValue(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength(),
                         cell.getFamilyArray(), cell.getFamilyOffset(), cell.getFamilyLength(), cell.getQualifierArray(),
                         cell.getQualifierOffset(), cell.getQualifierLength(), cell.getTimestamp(),
-                        KeyValue.Type.codeToType(cell.getTypeByte()), newValue, 0, newValue.length);
+                        KeyValue.Type.codeToType(cell.getType().getCode()), newValue, 0, newValue.length);
                     newCells.add(replacementCell);
                 } else {
+                    newCells.add(cell);
+                }
+            }
+            familyCellMap.put(family, newCells);
+        }
+    }
+
+    /**
+     * Iterates over the cells that are mutated by the put operation for the given column family and
+     * column qualifier and conditionally modifies those cells to add a tags list. We only add tags
+     * if the cell value does not match the passed valueArray. If we always want to add tags to
+     * these cells, we can pass in a null valueArray
+     * @param somePut Put operation
+     * @param family column family of the cells
+     * @param qualifier column qualifier of the cells
+     * @param cellBuilder ExtendedCellBuilder object
+     * @param valueArray byte array of values or null
+     * @param tagArray byte array of tags to add to the cells
+     */
+    public static void conditionallyAddTagsToPutCells(Put somePut, byte[] family, byte[] qualifier,
+            ExtendedCellBuilder cellBuilder, byte[] valueArray, byte[] tagArray) {
+        NavigableMap<byte[], List<Cell>> familyCellMap = somePut.getFamilyCellMap();
+        List<Cell> cells = familyCellMap.get(family);
+        List<Cell> newCells = Lists.newArrayList();
+        if (cells != null) {
+            for (Cell cell : cells) {
+                if (Bytes.compareTo(cell.getQualifierArray(), cell.getQualifierOffset(),
+                        cell.getQualifierLength(), qualifier, 0, qualifier.length) == 0 &&
+                        (valueArray == null || !CellUtil.matchingValue(cell, valueArray))) {
+                    ExtendedCell extendedCell = cellBuilder
+                            .setRow(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength())
+                            .setFamily(cell.getFamilyArray(), cell.getFamilyOffset(),
+                                    cell.getFamilyLength())
+                            .setQualifier(cell.getQualifierArray(), cell.getQualifierOffset(),
+                                    cell.getQualifierLength())
+                            .setValue(cell.getValueArray(), cell.getValueOffset(),
+                                    cell.getValueLength())
+                            .setTimestamp(cell.getTimestamp())
+                            .setType(cell.getType())
+                            .setTags(TagUtil.concatTags(tagArray, cell))
+                            .build();
+                    // Replace existing cell with a cell that has the custom tags list
+                    newCells.add(extendedCell);
+                } else {
+                    // Add cell as is
                     newCells.add(cell);
                 }
             }
@@ -337,7 +403,7 @@ public class MetaDataUtil {
         }
         return 0;
     }
-    
+
     public static long getParentSequenceNumber(List<Mutation> tableMetaData) {
         return getSequenceNumber(getParentTableHeaderRow(tableMetaData));
     }
@@ -700,17 +766,20 @@ public class MetaDataUtil {
         return true;
     }
 
-    public static final String IS_VIEW_INDEX_TABLE_PROP_NAME = "IS_VIEW_INDEX_TABLE";
-    public static final byte[] IS_VIEW_INDEX_TABLE_PROP_BYTES = Bytes.toBytes(IS_VIEW_INDEX_TABLE_PROP_NAME);
+    public static boolean propertyNotAllowedToBeOutOfSync(String colFamProp) {
+        return SYNCED_DATA_TABLE_AND_INDEX_COL_FAM_PROPERTIES.contains(colFamProp);
+    }
 
-    public static final String IS_LOCAL_INDEX_TABLE_PROP_NAME = "IS_LOCAL_INDEX_TABLE";
-    public static final byte[] IS_LOCAL_INDEX_TABLE_PROP_BYTES = Bytes.toBytes(IS_LOCAL_INDEX_TABLE_PROP_NAME);
-
-    public static final String DATA_TABLE_NAME_PROP_NAME = "DATA_TABLE_NAME";
-
-    public static final byte[] DATA_TABLE_NAME_PROP_BYTES = Bytes.toBytes(DATA_TABLE_NAME_PROP_NAME);
-
-
+    public static Map<String, Object> getSyncedProps(ColumnFamilyDescriptor defaultCFDesc) {
+        Map<String, Object> syncedProps = new HashMap<>();
+        if (defaultCFDesc != null) {
+            for (String propToKeepInSync: SYNCED_DATA_TABLE_AND_INDEX_COL_FAM_PROPERTIES) {
+                syncedProps.put(propToKeepInSync, Bytes.toString(
+                        defaultCFDesc.getValue(Bytes.toBytes(propToKeepInSync))));
+            }
+        }
+        return syncedProps;
+    }
 
     public static Scan newTableRowsScan(byte[] key, long startTimeStamp, long stopTimeStamp){
         return newTableRowsScan(key, null, startTimeStamp, stopTimeStamp);

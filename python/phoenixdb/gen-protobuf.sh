@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+set -x
 AVATICA_VER=rel/avatica-1.10.0
 
 set -e

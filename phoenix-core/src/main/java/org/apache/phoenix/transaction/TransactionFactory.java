@@ -22,17 +22,20 @@ import java.io.IOException;
 import org.apache.phoenix.coprocessor.MetaDataProtocol;
 
 
+
 public class TransactionFactory {
     public enum Provider {
-        TEPHRA((byte)1, TephraTransactionProvider.getInstance()),
-        OMID((byte)2, OmidTransactionProvider.getInstance());
+        TEPHRA((byte)1, TephraTransactionProvider.getInstance(), true),
+        OMID((byte)2, OmidTransactionProvider.getInstance(), true);
         
         private final byte code;
         private final PhoenixTransactionProvider provider;
+        private final boolean runTests;
         
-        Provider(byte code, PhoenixTransactionProvider provider) {
+        Provider(byte code, PhoenixTransactionProvider provider, boolean runTests) {
             this.code = code;
             this.provider = provider;
+            this.runTests = runTests;
         }
         
         public byte getCode() {
@@ -47,11 +50,15 @@ public class TransactionFactory {
         }
         
         public static Provider getDefault() {
-            return TEPHRA;
+            return OMID;
         }
 
         public PhoenixTransactionProvider getTransactionProvider()  {
             return provider;
+        }
+        
+        public boolean runTests() {
+            return runTests;
         }
     }
 
@@ -59,13 +66,21 @@ public class TransactionFactory {
         return provider.getTransactionProvider();
     }
     
-    public static PhoenixTransactionContext getTransactionContext(byte[] txState, int clientVersion) throws IOException {
+    public static PhoenixTransactionProvider getTransactionProvider(byte[] txState, int clientVersion) {
         if (txState == null || txState.length == 0) {
             return null;
         }
         Provider provider = (clientVersion < MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP_4_14_0) 
-                ? Provider.OMID
+                ? Provider.TEPHRA
                 : Provider.fromCode(txState[txState.length-1]);
-        return provider.getTransactionProvider().getTransactionContext(txState);
+        return provider.getTransactionProvider();
+    }
+    
+    public static PhoenixTransactionContext getTransactionContext(byte[] txState, int clientVersion) throws IOException {
+        PhoenixTransactionProvider provider = getTransactionProvider(txState, clientVersion);
+        if (provider == null) {
+            return null;
+        }
+        return provider.getTransactionContext(txState);
     }
 }

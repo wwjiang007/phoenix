@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import com.google.common.collect.ImmutableList;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.client.Scan;
@@ -76,12 +77,14 @@ import org.apache.phoenix.parse.SelectStatement;
 import org.apache.phoenix.parse.SequenceValueParseNode;
 import org.apache.phoenix.parse.UpsertStatement;
 import org.apache.phoenix.query.ConnectionQueryServices;
+import org.apache.phoenix.query.QueryConstants;
 import org.apache.phoenix.query.QueryServices;
 import org.apache.phoenix.query.QueryServicesOptions;
 import org.apache.phoenix.schema.ColumnRef;
 import org.apache.phoenix.schema.ConstraintViolationException;
 import org.apache.phoenix.schema.DelegateColumn;
 import org.apache.phoenix.schema.IllegalDataException;
+import org.apache.phoenix.schema.MetaDataClient;
 import org.apache.phoenix.schema.PColumn;
 import org.apache.phoenix.schema.PColumnImpl;
 import org.apache.phoenix.schema.PName;
@@ -107,7 +110,6 @@ import org.apache.phoenix.schema.types.PVarbinary;
 import org.apache.phoenix.util.ByteUtil;
 import org.apache.phoenix.util.ExpressionUtil;
 import org.apache.phoenix.util.IndexUtil;
-import org.apache.phoenix.util.MetaDataUtil;
 import org.apache.phoenix.util.ScanUtil;
 import org.apache.phoenix.util.SchemaUtil;
 
@@ -351,6 +353,9 @@ public class UpsertCompiler {
         boolean serverUpsertSelectEnabled =
                 services.getProps().getBoolean(QueryServices.ENABLE_SERVER_UPSERT_SELECT,
                         QueryServicesOptions.DEFAULT_ENABLE_SERVER_UPSERT_SELECT);
+        boolean allowServerMutations =
+                services.getProps().getBoolean(QueryServices.ENABLE_SERVER_SIDE_MUTATIONS,
+                        QueryServicesOptions.DEFAULT_ENABLE_SERVER_SIDE_MUTATIONS);
         UpsertingParallelIteratorFactory parallelIteratorFactoryToBe = null;
         boolean useServerTimestampToBe = false;
         
@@ -361,6 +366,8 @@ public class UpsertCompiler {
         // Cannot update:
         // - read-only VIEW
         // - transactional table with a connection having an SCN
+        // - mutable table with indexes and SCN set
+        // - tables with ROW_TIMESTAMP columns
         if (table.getType() == PTableType.VIEW && table.getViewType().isReadOnly()) {
             throw new ReadOnlyTableException(schemaName,tableName);
         } else if (connection.isBuildingIndex() && table.getType() != PTableType.INDEX) {
@@ -369,8 +376,25 @@ public class UpsertCompiler {
             .setTableName(tableName)
             .build().buildException();
         } else if (table.isTransactional() && connection.getSCN() != null) {
-            throw new SQLExceptionInfo.Builder(SQLExceptionCode.CANNOT_SPECIFY_SCN_FOR_TXN_TABLE).setSchemaName(schemaName)
-            .setTableName(tableName).build().buildException();
+            throw new SQLExceptionInfo.Builder(SQLExceptionCode
+                    .CANNOT_SPECIFY_SCN_FOR_TXN_TABLE)
+                    .setSchemaName(schemaName)
+                    .setTableName(tableName).build().buildException();
+        } else if (!table.isImmutableRows() && connection.getSCN() != null
+                && !table.getIndexes().isEmpty() && !connection.isRunningUpgrade()
+                && !connection.isBuildingIndex()) {
+            throw new SQLExceptionInfo
+                    .Builder(SQLExceptionCode
+                    .CANNOT_UPSERT_WITH_SCN_FOR_MUTABLE_TABLE_WITH_INDEXES)
+                    .setSchemaName(schemaName)
+                    .setTableName(tableName).build().buildException();
+        } else if(connection.getSCN() != null && !connection.isRunningUpgrade()
+                && !connection.isBuildingIndex() && table.getRowTimestampColPos() >= 0) {
+            throw new SQLExceptionInfo
+                    .Builder(SQLExceptionCode
+                    .CANNOT_UPSERT_WITH_SCN_FOR_ROW_TIMSTAMP_COLUMN)
+                    .setSchemaName(schemaName)
+                    .setTableName(tableName).build().buildException();
         }
         boolean isSalted = table.getBucketNum() != null;
         isTenantSpecific = table.isMultiTenant() && connection.getTenantId() != null;
@@ -539,10 +563,15 @@ public class UpsertCompiler {
                 // Disable running upsert select on server side if a table has global mutable secondary indexes on it
                 boolean hasGlobalMutableIndexes = SchemaUtil.hasGlobalIndex(table) && !table.isImmutableRows();
                 boolean hasWhereSubquery = select.getWhere() != null && select.getWhere().hasSubquery();
-                runOnServer = (sameTable || (serverUpsertSelectEnabled && !hasGlobalMutableIndexes)) && isAutoCommit && !table.isTransactional()
+                runOnServer = (sameTable || (serverUpsertSelectEnabled && !hasGlobalMutableIndexes)) && isAutoCommit 
+                        // We can run the upsert select for initial index population on server side for transactional
+                        // tables since the writes do not need to be done transactionally, since we gate the index
+                        // usage on successfully writing all data rows.
+                        && (!table.isTransactional() || table.getType() == PTableType.INDEX)
                         && !(table.isImmutableRows() && !table.getIndexes().isEmpty())
                         && !select.isJoin() && !hasWhereSubquery && table.getRowTimestampColPos() == -1;
             }
+            runOnServer &= allowServerMutations;
             // If we may be able to run on the server, add a hint that favors using the data table
             // if all else is equal.
             // TODO: it'd be nice if we could figure out in advance if the PK is potentially changing,
@@ -557,6 +586,21 @@ public class UpsertCompiler {
             // Use optimizer to choose the best plan
             QueryCompiler compiler = new QueryCompiler(statement, select, selectResolver, targetColumns, parallelIteratorFactoryToBe, new SequenceManager(statement), true, false, null);
             queryPlanToBe = compiler.compile();
+
+            if (sameTable) {
+                // in the UPSERT INTO X ... SELECT FROM X case enforce the source tableRef's TS
+                // as max TS, so that the query can safely restarted and still work of a snapshot
+                // (so it won't see its own data in case of concurrent splits)
+                // see PHOENIX-4849
+                long serverTime = selectResolver.getTables().get(0).getCurrentTime();
+                if (serverTime == QueryConstants.UNSET_TIMESTAMP) {
+                    // if this is the first time this table is resolved the ref's current time might not be defined, yet
+                    // in that case force an RPC to get the server time
+                    serverTime = new MetaDataClient(connection).getCurrentTime(schemaName, tableName);
+                }
+                Scan scan = queryPlanToBe.getContext().getScan();
+                ScanUtil.setTimeRange(scan, scan.getTimeRange().getMin(), serverTime);
+            }
             // This is post-fix: if the tableRef is a projected table, this means there are post-processing
             // steps and parallelIteratorFactory did not take effect.
             if (queryPlanToBe.getTableRef().getTable().getType() == PTableType.PROJECTED || queryPlanToBe.getTableRef().getTable().getType() == PTableType.SUBQUERY) {
@@ -681,9 +725,11 @@ public class UpsertCompiler {
                     }
                     // Build table from projectedColumns
                     // Hack to add default column family to be used on server in case no value column is projected.
-                    PTable projectedTable = PTableImpl.makePTable(table, projectedColumns,
-                            PNameFactory.newName(SchemaUtil.getEmptyColumnFamily(table)));  
-                    
+                    PTable projectedTable = PTableImpl.builderWithColumns(table, projectedColumns)
+                            .setExcludedColumns(ImmutableList.of())
+                            .setDefaultFamilyName(PNameFactory.newName(SchemaUtil.getEmptyColumnFamily(table)))
+                            .setColumns(projectedColumns)
+                            .build();
                     
                     SelectStatement select = SelectStatement.create(SelectStatement.COUNT_ONE, upsert.getHint());
                     StatementContext statementContext = queryPlan.getContext();
@@ -726,7 +772,7 @@ public class UpsertCompiler {
         final byte[][] values = new byte[nValuesToSet][];
         int nodeIndex = 0;
         if (isSharedViewIndex) {
-            values[nodeIndex++] = table.getViewIndexType().toBytes(table.getViewIndexId());
+            values[nodeIndex++] = table.getviewIndexIdType().toBytes(table.getViewIndexId());
         }
         if (isTenantSpecific) {
             PName tenantId = connection.getTenantId();
@@ -836,7 +882,8 @@ public class UpsertCompiler {
                     }
                     updateExpressions.add(updateExpression);
                 }
-                PTable onDupKeyTable = PTableImpl.makePTable(table, updateColumns);
+                PTable onDupKeyTable = PTableImpl.builderWithColumns(table, updateColumns)
+                        .build();
                 onDupKeyBytesToBe = PhoenixIndexBuilder.serializeOnDupKeyUpdate(onDupKeyTable, updateExpressions);
             }
         }
@@ -1022,12 +1069,15 @@ public class UpsertCompiler {
             byte[] txState = table.isTransactional() ?
                     connection.getMutationState().encodeTransaction() : ByteUtil.EMPTY_BYTE_ARRAY;
 
+            ScanUtil.setClientVersion(scan, MetaDataProtocol.PHOENIX_VERSION);
+            if (aggPlan.getTableRef().getTable().isTransactional() 
+                    || (table.getType() == PTableType.INDEX && table.isTransactional())) {
+                scan.setAttribute(BaseScannerRegionObserver.TX_STATE, txState);
+            }
             if (ptr.getLength() > 0) {
                 byte[] uuidValue = ServerCacheClient.generateId();
                 scan.setAttribute(PhoenixIndexCodec.INDEX_UUID, uuidValue);
                 scan.setAttribute(PhoenixIndexCodec.INDEX_PROTO_MD, ptr.get());
-                scan.setAttribute(BaseScannerRegionObserver.TX_STATE, txState);
-                ScanUtil.setClientVersion(scan, MetaDataProtocol.PHOENIX_VERSION);
             }
             ResultIterator iterator = aggPlan.iterator();
             try {
@@ -1295,7 +1345,7 @@ public class UpsertCompiler {
         public MutationState execute() throws SQLException {
             ResultIterator iterator = queryPlan.iterator();
             if (parallelIteratorFactory == null) {
-                return upsertSelect(new StatementContext(statement), tableRef, projector, iterator, columnIndexes, pkSlotIndexes, useServerTimestamp, false);
+                return upsertSelect(new StatementContext(statement, queryPlan.getContext().getScan()), tableRef, projector, iterator, columnIndexes, pkSlotIndexes, useServerTimestamp, false);
             }
             try {
                 parallelIteratorFactory.setRowProjector(projector);
