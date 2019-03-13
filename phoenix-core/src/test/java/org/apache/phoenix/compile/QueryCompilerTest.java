@@ -1111,6 +1111,13 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
         List<Object> binds = Collections.emptyList();
         compileQuery(query, binds);
     }
+
+    @Test
+    public void testCastingTimestampToDateInSelect() throws Exception {
+        String query = "SELECT CAST (a_timestamp AS DATE) FROM aTable";
+        List<Object> binds = Collections.emptyList();
+        compileQuery(query, binds);
+    }
     
     @Test
     public void testCastingStringToDecimalInSelect() throws Exception {
@@ -2951,6 +2958,129 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
             }
         }
     }
+
+    @Test
+    public void testOrderPreservingGroupByForNotPkColumns() throws Exception {
+         try (Connection conn= DriverManager.getConnection(getUrl())) {
+             conn.createStatement().execute("CREATE TABLE test (\n" +
+                    "            pk1 varchar, \n" +
+                    "            pk2 varchar, \n" +
+                    "            pk3 varchar, \n" +
+                    "            pk4 varchar, \n" +
+                    "            v1 varchar, \n" +
+                    "            v2 varchar,\n" +
+                    "            CONSTRAINT pk PRIMARY KEY (\n" +
+                    "               pk1,\n" +
+                    "               pk2,\n" +
+                    "               pk3,\n" +
+                    "               pk4\n" +
+                    "             )\n" +
+                    "         )");
+            String[] queries = new String[] {
+                    "SELECT pk3 FROM test WHERE v2 = 'a' GROUP BY substr(v2,0,1),pk3 ORDER BY pk3",
+                    "SELECT pk3 FROM test WHERE pk1 = 'c' and v2 = substr('abc',1,1) GROUP BY v2,pk3 ORDER BY pk3",
+                    "SELECT pk3 FROM test WHERE v1 = 'a' and v2 = 'b' GROUP BY length(v1)+length(v2),pk3 ORDER BY pk3",
+                    "SELECT pk3 FROM test WHERE pk1 = 'a' and v2 = 'b' GROUP BY length(pk1)+length(v2),pk3 ORDER BY pk3",
+                    "SELECT pk3 FROM test WHERE v1 = 'a' and v2 = substr('abc',2,1) GROUP BY pk4,CASE WHEN v1 > v2 THEN v1 ELSE v2 END,pk3 ORDER BY pk4,pk3",
+                    "SELECT pk3 FROM test WHERE pk1 = 'a' and v2 = substr('abc',2,1) GROUP BY pk4,CASE WHEN pk1 > v2 THEN pk1 ELSE v2 END,pk3 ORDER BY pk4,pk3",
+                    "SELECT pk3 FROM test WHERE pk1 = 'a' and pk2 = 'b' and v1 = 'c' GROUP BY CASE WHEN pk1 > pk2 THEN v1 WHEN pk1 = pk2 THEN pk1 ELSE pk2 END,pk3 ORDER BY pk3"
+            };
+            int index = 0;
+            for (String query : queries) {
+                QueryPlan plan = getQueryPlan(conn, query);
+                assertTrue((index + 1) + ") " + queries[index], plan.getOrderBy().getOrderByExpressions().isEmpty());
+                index++;
+            }
+        }
+    }
+
+    @Test
+    public void testOrderPreservingGroupByForClientAggregatePlan() throws Exception {
+        Connection conn = null;
+         try {
+             conn = DriverManager.getConnection(getUrl());
+             String tableName = "test_table";
+             String sql = "create table " + tableName + "( "+
+                     " pk1 varchar not null , " +
+                     " pk2 varchar not null, " +
+                     " pk3 varchar not null," +
+                     " v1 varchar, " +
+                     " v2 varchar, " +
+                     " CONSTRAINT TEST_PK PRIMARY KEY ( "+
+                        "pk1,"+
+                        "pk2,"+
+                        "pk3 ))";
+             conn.createStatement().execute(sql);
+
+             String[] queries = new String[] {
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "group by a.ak3,a.av1 order by a.ak3,a.av1",
+
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.av2 = 'a' GROUP BY substr(a.av2,0,1),ak3 ORDER BY ak3",
+
+                   //for InListExpression
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.av2 in('a') GROUP BY substr(a.av2,0,1),ak3 ORDER BY ak3",
+
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 = 'c' and a.av2 = substr('abc',1,1) GROUP BY a.av2,a.ak3 ORDER BY a.ak3",
+
+                   //for RVC
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where (a.ak1,a.av2) = ('c', substr('abc',1,1)) GROUP BY a.av2,a.ak3 ORDER BY a.ak3",
+
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.av1 = 'a' and a.av2 = 'b' GROUP BY length(a.av1)+length(a.av2),a.ak3 ORDER BY a.ak3",
+
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 = 'a' and a.av2 = 'b' GROUP BY length(a.ak1)+length(a.av2),a.ak3 ORDER BY a.ak3",
+
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3, coalesce(pk3,'1') ak4, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.av1 = 'a' and a.av2 = substr('abc',2,1) GROUP BY a.ak4,CASE WHEN a.av1 > a.av2 THEN a.av1 ELSE a.av2 END,a.ak3 ORDER BY a.ak4,a.ak3",
+
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 = 0.0 and a.av2 = (5+3*2) GROUP BY a.ak3,CASE WHEN a.ak1 > a.av2 THEN a.ak1 ELSE a.av2 END,a.av1 ORDER BY a.ak3,a.av1",
+
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 = 0.0 and a.av2 = length(substr('abc',1,1)) GROUP BY a.ak3,CASE WHEN a.ak1 > a.av2 THEN a.ak1 ELSE a.av2 END,a.av1 ORDER BY a.ak3,a.av1",
+
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 = 0.0 and a.av2 = length(substr('abc',1,1)) GROUP BY a.ak3,CASE WHEN coalesce(a.ak1,1) > coalesce(a.av2,2) THEN coalesce(a.ak1,1) ELSE coalesce(a.av2,2) END,a.av1 ORDER BY a.ak3,a.av1",
+
+                   //for IS NULL
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 is null and a.av2 = length(substr('abc',1,1)) GROUP BY a.ak3,CASE WHEN coalesce(a.ak1,1) > coalesce(a.av2,2) THEN coalesce(a.ak1,1) ELSE coalesce(a.av2,2) END,a.av1 ORDER BY a.ak3,a.av1",
+
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 = 0.0 and a.av2 is null GROUP BY a.ak3,CASE WHEN coalesce(a.ak1,1) > coalesce(a.av2,2) THEN coalesce(a.ak1,1) ELSE coalesce(a.av2,2) END,a.av1 ORDER BY a.ak3,a.av1",
+             };
+              int index = 0;
+             for (String query : queries) {
+                 QueryPlan plan =  TestUtil.getOptimizeQueryPlan(conn, query);
+                 assertTrue((index + 1) + ") " + queries[index], plan.getOrderBy()== OrderBy.FWD_ROW_KEY_ORDER_BY);
+                 index++;
+             }
+         }
+         finally {
+             if(conn != null) {
+                 conn.close();
+             }
+         }
+    }
     
     @Test
     public void testNotOrderPreservingGroupBy() throws Exception {
@@ -2987,6 +3117,207 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
         }
     }
     
+    @Test
+    public void testNotOrderPreservingGroupByForNotPkColumns() throws Exception {
+        try (Connection conn= DriverManager.getConnection(getUrl())) {
+            conn.createStatement().execute("CREATE TABLE test (\n" +
+                    "            pk1 varchar,\n" +
+                    "            pk2 varchar,\n" +
+                    "            pk3 varchar,\n" +
+                    "            pk4 varchar,\n" +
+                    "            v1 varchar,\n" +
+                    "            v2 varchar,\n" +
+                    "            CONSTRAINT pk PRIMARY KEY (\n" +
+                    "               pk1,\n" +
+                    "               pk2,\n" +
+                    "               pk3,\n" +
+                    "               pk4\n" +
+                    "             )\n" +
+                    "         )");
+             String[] queries = new String[] {
+                     "SELECT pk3 FROM test WHERE (pk1 = 'a' and pk2 = 'b') or v1 ='c' GROUP BY pk4,CASE WHEN pk1 > pk2 THEN coalesce(v1,'1') ELSE pk2 END,pk3 ORDER BY pk4,pk3",
+                     "SELECT pk3 FROM test WHERE pk1 = 'a' or pk2 = 'b' GROUP BY CASE WHEN pk1 > pk2 THEN v1 WHEN pk1 = pk2 THEN pk1 ELSE pk2 END,pk3 ORDER BY pk3",
+                     "SELECT pk3 FROM test WHERE pk1 = 'a' and (pk2 = 'b' or v1 = 'c') GROUP BY CASE WHEN pk1 > pk2 THEN v1 WHEN pk1 = pk2 THEN pk1 ELSE pk2 END,pk3 ORDER BY pk3",
+                     "SELECT v2 FROM test GROUP BY v1,v2 ORDER BY v2",
+                     "SELECT pk3 FROM test WHERE v1 = 'a' GROUP BY v1,v2,pk3 ORDER BY pk3",
+                     "SELECT length(pk3) FROM test WHERE v1 = 'a' GROUP BY RAND()+length(v1),length(v2),length(pk3) ORDER BY length(v2),length(pk3)",
+                     "SELECT length(pk3) FROM test WHERE v1 = 'a' and v2 = 'b' GROUP BY CASE WHEN v1 > v2 THEN length(v1) ELSE RAND(1) END,length(pk3) ORDER BY length(pk3)",
+             };
+             int index = 0;
+            for (String query : queries) {
+                QueryPlan plan = getQueryPlan(conn, query);
+                assertFalse((index + 1) + ") " + queries[index], plan.getOrderBy().getOrderByExpressions().isEmpty());
+                index++;
+            }
+        }
+    }
+
+    @Test
+    public void testNotOrderPreservingGroupByForClientAggregatePlan() throws Exception {
+        Connection conn = null;
+        try {
+            conn = DriverManager.getConnection(getUrl());
+            String tableName = "table_test";
+            String sql = "create table " + tableName + "( "+
+                    " pk1 varchar not null , " +
+                    " pk2 varchar not null, " +
+                    " pk3 varchar not null," +
+                    " v1 varchar, " +
+                    " v2 varchar, " +
+                    " CONSTRAINT TEST_PK PRIMARY KEY ( "+
+                    "pk1,"+
+                    "pk2,"+
+                    "pk3 ))";
+            conn.createStatement().execute(sql);
+
+            String[] queries = new String[] {
+                  "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,coalesce(pk3,'1') ak4, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where (a.ak1 = 'a' and a.ak2 = 'b') or a.av1 ='c' GROUP BY a.ak4,CASE WHEN a.ak1 > a.ak2 THEN coalesce(a.av1,'1') ELSE a.ak2 END,a.ak3 ORDER BY a.ak4,a.ak3",
+
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,coalesce(pk3,'1') ak4, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 = 'a' or a.ak2 = 'b' GROUP BY CASE WHEN a.ak1 > a.ak2 THEN a.av1 WHEN a.ak1 = a.ak2 THEN a.ak1 ELSE a.ak2 END,a.ak3 ORDER BY a.ak3",
+
+                   //for in
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,coalesce(pk3,'1') ak4, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 in ( 'a','b') GROUP BY CASE WHEN a.ak1 > a.ak2 THEN a.av1 WHEN a.ak1 = a.ak2 THEN a.ak1 ELSE a.ak2 END,a.ak3 ORDER BY a.ak3",
+
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,coalesce(pk3,'1') ak4, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 = 'a' and (a.ak2 = 'b' or a.av1 = 'c') GROUP BY CASE WHEN a.ak1 > a.ak2 THEN a.av1 WHEN a.ak1 = a.ak2 THEN a.ak1 ELSE a.ak2 END,a.ak3 ORDER BY a.ak3",
+
+                   "select a.av2 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,coalesce(pk3,'1') ak4, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "GROUP BY a.av1,a.av2 ORDER BY a.av2",
+
+                   "select a.ak3 "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,coalesce(pk3,'1') ak4, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.av1 = 'a' GROUP BY a.av1,a.av2,a.ak3 ORDER BY a.ak3",
+
+                   "select length(a.ak3) "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,coalesce(pk3,'1') ak4, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.av1 = 'a' GROUP BY RAND()+length(a.av1),length(a.av2),length(a.ak3) ORDER BY length(a.av2),length(a.ak3)",
+
+                   "select length(a.ak3) "+
+                   "from (select substr(pk1,1,1) ak1,substr(pk2,1,1) ak2,substr(pk3,1,1) ak3,coalesce(pk3,'1') ak4, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.av1 = 'a' and a.av2 = 'b' GROUP BY CASE WHEN a.av1 > a.av2 THEN length(a.av1) ELSE RAND(1) END,length(a.ak3) ORDER BY length(a.ak3)",
+
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 > 0.0 and a.av2 = (5+3*2) GROUP BY a.ak3,CASE WHEN a.ak1 > a.av2 THEN a.ak1 ELSE a.av2 END,a.av1 ORDER BY a.ak3,a.av1",
+
+                   //for CoerceExpression
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where CAST(a.ak1 AS INTEGER) = 0 and a.av2 = (5+3*2) GROUP BY a.ak3,a.ak1,a.av1 ORDER BY a.ak3,a.av1",
+
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 = 0.0 or a.av2 = length(substr('abc',1,1)) GROUP BY a.ak3,CASE WHEN coalesce(a.ak1,1) > coalesce(a.av2,2) THEN coalesce(a.ak1,1) ELSE coalesce(a.av2,2) END,a.av1 ORDER BY a.ak3,a.av1",
+
+                   //for IS NULL
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 is not null and a.av2 = length(substr('abc',1,1)) GROUP BY a.ak3,CASE WHEN coalesce(a.ak1,1) > coalesce(a.av2,2) THEN coalesce(a.ak1,1) ELSE coalesce(a.av2,2) END,a.av1 ORDER BY a.ak3,a.av1",
+
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 is null or a.av2 = length(substr('abc',1,1)) GROUP BY a.ak3,CASE WHEN coalesce(a.ak1,1) > coalesce(a.av2,2) THEN coalesce(a.ak1,1) ELSE coalesce(a.av2,2) END,a.av1 ORDER BY a.ak3,a.av1",
+
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 is null and a.av2 = length(substr('abc',1,1)) and a.ak1 = 0.0 GROUP BY a.ak3,CASE WHEN coalesce(a.ak1,1) > coalesce(a.av2,2) THEN coalesce(a.ak1,1) ELSE coalesce(a.av2,2) END,a.av1 ORDER BY a.ak3,a.av1",
+
+                   "select a.ak3 "+
+                   "from (select rand() ak1,length(pk2) ak2,length(pk3) ak3,length(v1) av1,length(v2) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                   "where a.ak1 is null and a.av2 = length(substr('abc',1,1)) or a.ak1 = 0.0 GROUP BY a.ak3,CASE WHEN coalesce(a.ak1,1) > coalesce(a.av2,2) THEN coalesce(a.ak1,1) ELSE coalesce(a.av2,2) END,a.av1 ORDER BY a.ak3,a.av1",
+             };
+            int index = 0;
+            for (String query : queries) {
+                QueryPlan plan = TestUtil.getOptimizeQueryPlan(conn, query);
+                assertTrue((index + 1) + ") " + queries[index], plan.getOrderBy().getOrderByExpressions().size() > 0);
+                index++;
+            }
+        }
+        finally {
+            if(conn != null) {
+                conn.close();
+            }
+        }
+    }
+
+    @Test
+    public void testOrderByOptimizeForClientAggregatePlanAndDesc() throws Exception {
+        Connection conn = null;
+        try {
+            conn = DriverManager.getConnection(getUrl());
+            String tableName = "test_table";
+            String sql = "create table " + tableName + "( "+
+                    " pk1 varchar not null, " +
+                    " pk2 varchar not null, " +
+                    " pk3 varchar not null, " +
+                    " v1 varchar, " +
+                    " v2 varchar, " +
+                    " CONSTRAINT TEST_PK PRIMARY KEY ( "+
+                    "pk1 desc,"+
+                    "pk2 desc,"+
+                    "pk3 desc))";
+            conn.createStatement().execute(sql);
+
+            String[] queries = new String[] {
+                     "select a.ak3 "+
+                     "from (select pk1 ak1,pk2 ak2,pk3 ak3, substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                     "group by a.ak3,a.av1 order by a.ak3 desc,a.av1",
+
+                     "select a.ak3 "+
+                     "from (select pk1 ak1,pk2 ak2,pk3 ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                     "where a.av1 = 'a' group by a.av1,a.ak3 order by a.ak3 desc",
+
+                     "select a.ak3 "+
+                     "from (select pk1 ak1,pk2 ak2,pk3 ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                     "where a.av1 = 'a' and a.av2= 'b' group by CASE WHEN a.av1 > a.av2 THEN a.av1 ELSE a.av2 END,a.ak3,a.ak2 order by a.ak3 desc,a.ak2 desc"
+            };
+
+            int index = 0;
+            for (String query : queries) {
+                QueryPlan plan =  TestUtil.getOptimizeQueryPlan(conn, query);
+                assertTrue((index + 1) + ") " + queries[index], plan.getOrderBy()== OrderBy.FWD_ROW_KEY_ORDER_BY);
+                index++;
+            }
+
+            queries = new String[] {
+                     "select a.ak3 "+
+                     "from (select pk1 ak1,pk2 ak2,pk3 ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                     "group by a.ak3,a.av1 order by a.ak3,a.av1",
+
+                     "select a.ak3 "+
+                     "from (select pk1 ak1,pk2 ak2,pk3 ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                     "where a.av1 = 'a' group by a.av1,a.ak3 order by a.ak3",
+
+                     "select a.ak3 "+
+                     "from (select pk1 ak1,pk2 ak2,pk3 ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                     "where a.av1 = 'a' and a.av2= 'b' group by CASE WHEN a.av1 > a.av2 THEN a.av1 ELSE a.av2 END,a.ak3,a.ak2 order by a.ak3,a.ak2",
+
+                     "select a.ak3 "+
+                     "from (select pk1 ak1,pk2 ak2,pk3 ak3,substr(v1,1,1) av1,substr(v2,1,1) av2 from "+tableName+" order by pk2,pk3 limit 10) a "+
+                     "where a.av1 = 'a' and a.av2= 'b' group by CASE WHEN a.av1 > a.av2 THEN a.av1 ELSE a.av2 END,a.ak3,a.ak2 order by a.ak3 asc,a.ak2 desc"
+            };
+            index = 0;
+            for (String query : queries) {
+                QueryPlan plan = TestUtil.getOptimizeQueryPlan(conn, query);
+                assertTrue((index + 1) + ") " + queries[index], plan.getOrderBy().getOrderByExpressions().size() > 0);
+                index++;
+            }
+        }
+        finally {
+            if(conn != null) {
+                conn.close();
+            }
+        }
+    }
+
     @Test
     public void testGroupByDescColumnBug3451() throws Exception {
 
@@ -4956,6 +5287,224 @@ public class QueryCompilerTest extends BaseConnectionlessQueryTest {
             assertTrue(queryPlan.getOrderBy() == (!desc ? OrderBy.REV_ROW_KEY_ORDER_BY : OrderBy.FWD_ROW_KEY_ORDER_BY));
         } finally {
             if(conn != null) {
+                conn.close();
+            }
+        }
+    }
+
+    @Test
+    public void testSortMergeJoinPushFilterThroughSortBug5105() throws Exception {
+        Connection conn = null;
+        try {
+            conn= DriverManager.getConnection(getUrl());
+
+            String tableName1="MERGE1";
+            String tableName2="MERGE2";
+
+            conn.createStatement().execute("DROP TABLE if exists "+tableName1);
+
+            String sql="CREATE TABLE IF NOT EXISTS "+tableName1+" ( "+
+                    "AID INTEGER PRIMARY KEY,"+
+                    "AGE INTEGER"+
+                    ")";
+            conn.createStatement().execute(sql);
+
+            conn.createStatement().execute("DROP TABLE if exists "+tableName2);
+            sql="CREATE TABLE IF NOT EXISTS "+tableName2+" ( "+
+                    "BID INTEGER PRIMARY KEY,"+
+                    "CODE INTEGER"+
+                    ")";
+            conn.createStatement().execute(sql);
+
+            //test for simple scan
+            sql="select /*+ USE_SORT_MERGE_JOIN */ a.aid,b.code from (select aid,age from "+tableName1+" where age >=11 and age<=33 order by age limit 3) a inner join "+
+                "(select bid,code from "+tableName2+" order by code limit 1) b on a.aid=b.bid where b.code > 50";
+
+            QueryPlan queryPlan=getQueryPlan(conn, sql);
+            SortMergeJoinPlan sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            ClientScanPlan lhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getLhsPlan())).getDelegate();
+            OrderBy orderBy=lhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            ScanPlan innerScanPlan=(ScanPlan)((TupleProjectionPlan)lhsOuterPlan.getDelegate()).getDelegate();
+            orderBy=innerScanPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AGE"));
+            assertTrue(innerScanPlan.getLimit().intValue() == 3);
+
+            ClientScanPlan rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            String tableAlias = rhsOuterPlan.getTableRef().getTableAlias();
+            String rewrittenSql = "SELECT "+tableAlias+".BID,"+tableAlias+".CODE FROM (SELECT BID,CODE FROM MERGE2  ORDER BY CODE LIMIT 1) "+tableAlias+" WHERE "+tableAlias+".CODE > 50 ORDER BY "+tableAlias+".BID";
+            assertTrue(rhsOuterPlan.getStatement().toString().equals(rewrittenSql));
+
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("BID"));
+            innerScanPlan=(ScanPlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate();
+            orderBy=innerScanPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("CODE"));
+            assertTrue(innerScanPlan.getLimit().intValue() == 1);
+
+            //test for aggregate
+            sql="select /*+ USE_SORT_MERGE_JOIN */ a.aid,b.codesum from (select aid,sum(age) agesum from "+tableName1+" where age >=11 and age<=33 group by aid order by agesum limit 3) a inner join "+
+                "(select bid,sum(code) codesum from "+tableName2+" group by bid order by codesum limit 1) b on a.aid=b.bid where b.codesum > 50";
+
+
+            queryPlan=getQueryPlan(conn, sql);
+            sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            lhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getLhsPlan())).getDelegate();
+            orderBy=lhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            AggregatePlan innerAggregatePlan=(AggregatePlan)((TupleProjectionPlan)lhsOuterPlan.getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("SUM(AGE)"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 3);
+
+            rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            tableAlias = rhsOuterPlan.getTableRef().getTableAlias();
+            rewrittenSql = "SELECT "+tableAlias+".BID,"+tableAlias+".CODESUM FROM (SELECT BID, SUM(CODE) CODESUM FROM MERGE2  GROUP BY BID ORDER BY CODESUM LIMIT 1) "+tableAlias+" WHERE "+tableAlias+".CODESUM > 50 ORDER BY "+tableAlias+".BID";
+            assertTrue(rhsOuterPlan.getStatement().toString().equals(rewrittenSql));
+
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("BID"));
+            innerAggregatePlan=(AggregatePlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("SUM(CODE)"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 1);
+
+            String tableName3="merge3";
+            conn.createStatement().execute("DROP TABLE if exists "+tableName3);
+            sql="CREATE TABLE IF NOT EXISTS "+tableName3+" ( "+
+                    "CID INTEGER PRIMARY KEY,"+
+                    "REGION INTEGER"+
+                    ")";
+            conn.createStatement().execute(sql);
+
+            //test for join
+            sql="select t1.aid,t1.code,t2.region from "+
+                "(select a.aid,b.code from "+tableName1+" a inner join "+tableName2+" b on a.aid=b.bid where b.code >=44 and b.code<=66 order by b.code limit 3) t1 inner join "+
+                "(select a.aid,c.region from "+tableName1+" a inner join "+tableName3+" c on a.aid=c.cid where c.region>=77 and c.region<=99 order by c.region desc limit 1) t2 on t1.aid=t2.aid "+
+                "where t1.code > 50";
+
+            PhoenixPreparedStatement phoenixPreparedStatement = conn.prepareStatement(sql).unwrap(PhoenixPreparedStatement.class);
+            queryPlan = phoenixPreparedStatement.optimizeQuery(sql);
+            sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            lhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getLhsPlan())).getDelegate();
+            tableAlias = lhsOuterPlan.getTableRef().getTableAlias();
+            rewrittenSql = "SELECT "+tableAlias+".AID,"+tableAlias+".CODE FROM (SELECT A.AID,B.CODE FROM MERGE1 A  Inner JOIN MERGE2 B  ON (A.AID = B.BID) WHERE (B.CODE >= 44 AND B.CODE <= 66) ORDER BY B.CODE LIMIT 3) "+
+                           tableAlias+" WHERE "+tableAlias+".CODE > 50 ORDER BY "+tableAlias+".AID";
+            assertTrue(lhsOuterPlan.getStatement().toString().equals(rewrittenSql));
+
+            orderBy=lhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerScanPlan=(ScanPlan)((HashJoinPlan)((TupleProjectionPlan)lhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerScanPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("B.CODE"));
+            assertTrue(innerScanPlan.getLimit().intValue() == 3);
+
+            rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerScanPlan=(ScanPlan)((HashJoinPlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerScanPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("C.REGION DESC"));
+            assertTrue(innerScanPlan.getLimit().intValue() == 1);
+
+            //test for join and aggregate
+            sql="select t1.aid,t1.codesum,t2.regionsum from "+
+                "(select a.aid,sum(b.code) codesum from "+tableName1+" a inner join "+tableName2+" b on a.aid=b.bid where b.code >=44 and b.code<=66 group by a.aid order by codesum limit 3) t1 inner join "+
+                "(select a.aid,sum(c.region) regionsum from "+tableName1+" a inner join "+tableName3+" c on a.aid=c.cid where c.region>=77 and c.region<=99 group by a.aid order by regionsum desc limit 2) t2 on t1.aid=t2.aid "+
+                "where t1.codesum >=40 and t2.regionsum >= 90";
+
+            phoenixPreparedStatement = conn.prepareStatement(sql).unwrap(PhoenixPreparedStatement.class);
+            queryPlan = phoenixPreparedStatement.optimizeQuery(sql);
+            sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            lhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getLhsPlan())).getDelegate();
+            tableAlias = lhsOuterPlan.getTableRef().getTableAlias();
+            rewrittenSql = "SELECT "+tableAlias+".AID,"+tableAlias+".CODESUM FROM (SELECT A.AID, SUM(B.CODE) CODESUM FROM MERGE1 A  Inner JOIN MERGE2 B  ON (A.AID = B.BID) WHERE (B.CODE >= 44 AND B.CODE <= 66) GROUP BY A.AID ORDER BY CODESUM LIMIT 3) "+tableAlias+
+                           " WHERE "+tableAlias+".CODESUM >= 40 ORDER BY "+tableAlias+".AID";
+            assertTrue(lhsOuterPlan.getStatement().toString().equals(rewrittenSql));
+
+            orderBy=lhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerAggregatePlan=(AggregatePlan)((HashJoinPlan)((TupleProjectionPlan)lhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("SUM(B.CODE)"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 3);
+
+            rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            tableAlias = rhsOuterPlan.getTableRef().getTableAlias();
+            rewrittenSql = "SELECT "+tableAlias+".AID,"+tableAlias+".REGIONSUM FROM (SELECT A.AID, SUM(C.REGION) REGIONSUM FROM MERGE1 A  Inner JOIN MERGE3 C  ON (A.AID = C.CID) WHERE (C.REGION >= 77 AND C.REGION <= 99) GROUP BY A.AID ORDER BY REGIONSUM DESC LIMIT 2) "+tableAlias+
+                           " WHERE "+tableAlias+".REGIONSUM >= 90 ORDER BY "+tableAlias+".AID";
+            assertTrue(rhsOuterPlan.getStatement().toString().equals(rewrittenSql));
+
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerAggregatePlan=(AggregatePlan)((HashJoinPlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("SUM(C.REGION) DESC"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 2);
+
+            //test for if SubselectRewriter.isOrderByPrefix had take effect
+            sql="select t1.aid,t1.codesum,t2.regionsum from "+
+                "(select a.aid,sum(b.code) codesum from "+tableName1+" a inner join "+tableName2+" b on a.aid=b.bid where b.code >=44 and b.code<=66 group by a.aid order by a.aid,codesum limit 3) t1 inner join "+
+                "(select a.aid,sum(c.region) regionsum from "+tableName1+" a inner join "+tableName3+" c on a.aid=c.cid where c.region>=77 and c.region<=99 group by a.aid order by a.aid desc,regionsum desc limit 2) t2 on t1.aid=t2.aid "+
+                 "where t1.codesum >=40 and t2.regionsum >= 90 order by t1.aid desc";
+
+            phoenixPreparedStatement = conn.prepareStatement(sql).unwrap(PhoenixPreparedStatement.class);
+            queryPlan = phoenixPreparedStatement.optimizeQuery(sql);
+            orderBy=queryPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("T1.AID DESC"));
+            sortMergeJoinPlan=(SortMergeJoinPlan)((ClientScanPlan)queryPlan).getDelegate();
+
+            lhsOuterPlan = (ClientScanPlan)(((TupleProjectionPlan)sortMergeJoinPlan.getLhsPlan()).getDelegate());
+            tableAlias = lhsOuterPlan.getTableRef().getTableAlias();
+            rewrittenSql = "SELECT "+tableAlias+".AID,"+tableAlias+".CODESUM FROM (SELECT A.AID, SUM(B.CODE) CODESUM FROM MERGE1 A  Inner JOIN MERGE2 B  ON (A.AID = B.BID) WHERE (B.CODE >= 44 AND B.CODE <= 66) GROUP BY A.AID ORDER BY A.AID,CODESUM LIMIT 3) "+tableAlias+
+                           " WHERE "+tableAlias+".CODESUM >= 40";
+            assertTrue(lhsOuterPlan.getStatement().toString().equals(rewrittenSql));
+
+            innerAggregatePlan=(AggregatePlan)((HashJoinPlan)((TupleProjectionPlan)lhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 2);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("A.AID"));
+            assertTrue(orderBy.getOrderByExpressions().get(1).toString().equals("SUM(B.CODE)"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 3);
+
+            rhsOuterPlan=(ClientScanPlan)((TupleProjectionPlan)(sortMergeJoinPlan.getRhsPlan())).getDelegate();
+            tableAlias = rhsOuterPlan.getTableRef().getTableAlias();
+            rewrittenSql = "SELECT "+tableAlias+".AID,"+tableAlias+".REGIONSUM FROM (SELECT A.AID, SUM(C.REGION) REGIONSUM FROM MERGE1 A  Inner JOIN MERGE3 C  ON (A.AID = C.CID) WHERE (C.REGION >= 77 AND C.REGION <= 99) GROUP BY A.AID ORDER BY A.AID DESC,REGIONSUM DESC LIMIT 2) "+tableAlias+
+                           " WHERE "+tableAlias+".REGIONSUM >= 90 ORDER BY "+tableAlias+".AID";
+            assertTrue(rhsOuterPlan.getStatement().toString().equals(rewrittenSql));
+
+            orderBy=rhsOuterPlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 1);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("AID"));
+            innerAggregatePlan=(AggregatePlan)((HashJoinPlan)((TupleProjectionPlan)rhsOuterPlan.getDelegate()).getDelegate()).getDelegate();
+            orderBy=innerAggregatePlan.getOrderBy();
+            assertTrue(orderBy.getOrderByExpressions().size() == 2);
+            assertTrue(orderBy.getOrderByExpressions().get(0).toString().equals("A.AID DESC"));
+            assertTrue(orderBy.getOrderByExpressions().get(1).toString().equals("SUM(C.REGION) DESC"));
+            assertTrue(innerAggregatePlan.getLimit().intValue() == 2);
+        } finally {
+            if(conn!=null) {
                 conn.close();
             }
         }

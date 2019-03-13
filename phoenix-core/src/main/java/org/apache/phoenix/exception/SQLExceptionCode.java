@@ -34,6 +34,7 @@ import org.apache.phoenix.schema.ColumnNotFoundException;
 import org.apache.phoenix.schema.ConcurrentTableMutationException;
 import org.apache.phoenix.schema.FunctionAlreadyExistsException;
 import org.apache.phoenix.schema.FunctionNotFoundException;
+import org.apache.phoenix.schema.IndexNotFoundException;
 import org.apache.phoenix.schema.ReadOnlyTableException;
 import org.apache.phoenix.schema.SchemaAlreadyExistsException;
 import org.apache.phoenix.schema.SchemaNotFoundException;
@@ -223,6 +224,12 @@ public enum SQLExceptionCode {
         @Override
         public SQLException newException(SQLExceptionInfo info) {
             return new TableNotFoundException(info.getSchemaName(), info.getTableName());
+        }
+    }),
+    INDEX_UNDEFINED(1042, "42M06", "Index undefined.", new Factory() {
+        @Override
+        public SQLException newException(SQLExceptionInfo info) {
+            return new IndexNotFoundException(info.getSchemaName(), info.getTableName());
         }
     }),
     TABLE_ALREADY_EXIST(1013, "42M04", "Table already exists.", new Factory() {
@@ -463,6 +470,8 @@ public enum SQLExceptionCode {
     MAX_MUTATION_SIZE_BYTES_EXCEEDED(730, "LIM02", "MutationState size is bigger than maximum allowed number of bytes"), 
     INSUFFICIENT_MEMORY(999, "50M01", "Unable to allocate enough memory."),
     HASH_JOIN_CACHE_NOT_FOUND(900, "HJ01", "Hash Join cache not found"),
+
+    STATS_COLLECTION_DISABLED_ON_SERVER(1401, "STS01", "Stats collection attempted but is disabled on server"),
 
     CANNOT_UPSERT_WITH_SCN_FOR_ROW_TIMSTAMP_COLUMN(901,"43M12",
             "Cannot use a connection with SCN set to upsert data for " +

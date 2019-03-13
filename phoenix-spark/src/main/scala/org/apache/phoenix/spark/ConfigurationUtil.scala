@@ -17,18 +17,20 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.hbase.{HBaseConfiguration, HConstants}
 import org.apache.phoenix.jdbc.PhoenixEmbeddedDriver
 import org.apache.phoenix.mapreduce.util.{ColumnInfoToStringEncoderDecoder, PhoenixConfigurationUtil}
+import org.apache.phoenix.query.HBaseFactoryProvider
 import org.apache.phoenix.util.{ColumnInfo, PhoenixRuntime}
 
 import scala.collection.JavaConversions._
 
+@deprecated("Use the DataSource V2 API implementation (see PhoenixDataSource)")
 object ConfigurationUtil extends Serializable {
 
   def getOutputConfiguration(tableName: String, columns: Seq[String], zkUrl: Option[String], tenantId: Option[String] = None, conf: Option[Configuration] = None): Configuration = {
 
     // Create an HBaseConfiguration object from the passed in config, if present
     val config = conf match {
-      case Some(c) => HBaseConfiguration.create(c)
-      case _ => HBaseConfiguration.create()
+      case Some(c) => HBaseFactoryProvider.getConfigurationFactory.getConfiguration(c)
+      case _ => HBaseFactoryProvider.getConfigurationFactory.getConfiguration()
     }
 
     // Set the tenantId in the config if present
@@ -40,6 +42,8 @@ object ConfigurationUtil extends Serializable {
     // Set the table to save to
     PhoenixConfigurationUtil.setOutputTableName(config, tableName)
     PhoenixConfigurationUtil.setPhysicalTableName(config, tableName)
+    // disable property provider evaluation
+    PhoenixConfigurationUtil.setPropertyPolicyProviderDisabled(config);
 
     // Infer column names from the DataFrame schema
     PhoenixConfigurationUtil.setUpsertColumnNames(config, Array(columns : _*))

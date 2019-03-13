@@ -80,6 +80,10 @@ public class ProjectedColumnExpression extends ColumnExpression {
     public int getPosition() {
     	return position;
     }
+
+    public Collection<PColumn> getColumns() {
+	    return columns;
+    }
     
     @Override
     public String toString() {
@@ -153,12 +157,12 @@ public class ProjectedColumnExpression extends ColumnExpression {
     }
 
     @Override
-    public Determinism getDeterminism() {
-        return Determinism.PER_INVOCATION;
+    public ProjectedColumnExpression clone() {
+        return new ProjectedColumnExpression(this.column, this.columns, this.position, this.displayName);
     }
 
     @Override
-    public ProjectedColumnExpression clone() {
-        return new ProjectedColumnExpression(this.column, this.columns, this.position, this.displayName);
+    public boolean isCloneExpression() {
+        return true;
     }
 }
