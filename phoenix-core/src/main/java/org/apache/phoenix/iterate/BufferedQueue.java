@@ -23,9 +23,8 @@ import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.AbstractQueue;
 import java.util.Comparator;
 import java.util.Iterator;
@@ -36,14 +35,14 @@ import java.util.UUID;
 import com.google.common.collect.Lists;
 import com.google.common.collect.MinMaxPriorityQueue;
 
-public abstract class BufferedQueue<T> extends AbstractQueue<T> {
-    private final int thresholdBytes;
+public abstract class BufferedQueue<T> extends AbstractQueue<T> implements SizeAwareQueue<T> {
+    private final long thresholdBytes;
     private List<BufferedSegmentQueue<T>> queues;
     private int currentIndex;
     private BufferedSegmentQueue<T> currentQueue;
     private MinMaxPriorityQueue<BufferedSegmentQueue<T>> mergedQueue;
 
-    public BufferedQueue(int thresholdBytes) {
+    public BufferedQueue(long thresholdBytes) {
         this.thresholdBytes = thresholdBytes;
         this.queues = Lists.<BufferedSegmentQueue<T>> newArrayList();
         this.currentIndex = -1;
@@ -51,7 +50,7 @@ public abstract class BufferedQueue<T> extends AbstractQueue<T> {
         this.mergedQueue = null;
     }
     
-    abstract protected BufferedSegmentQueue<T> createSegmentQueue(int index, int thresholdBytes);
+    abstract protected BufferedSegmentQueue<T> createSegmentQueue(int index, long thresholdBytes);
     
     abstract protected Comparator<BufferedSegmentQueue<T>> getSegmentQueueComparator();
     
@@ -122,10 +121,12 @@ public abstract class BufferedQueue<T> extends AbstractQueue<T> {
         return size;
     }
     
+    @Override
     public long getByteSize() {
         return currentQueue == null ? 0 : currentQueue.getInMemByteSize();
     }
 
+    @Override
     public void close() {
         for (BufferedSegmentQueue<T> queue : queues) {
             queue.close();
@@ -150,10 +151,10 @@ public abstract class BufferedQueue<T> extends AbstractQueue<T> {
         protected static final int EOF = -1;
         
         private final int index;
-        private final int thresholdBytes;
+        private final long thresholdBytes;
         private final boolean hasMaxQueueSize;
         private long totalResultSize = 0;
-        private int maxResultSize = 0;
+        private long maxResultSize = 0;
         private File file;
         private boolean isClosed = false;
         private boolean flushBuffer = false;
@@ -163,7 +164,7 @@ public abstract class BufferedQueue<T> extends AbstractQueue<T> {
         // iterators to close on close()
         private List<SegmentQueueFileIterator> iterators;
 
-        public BufferedSegmentQueue(int index, int thresholdBytes, boolean hasMaxQueueSize) {
+        public BufferedSegmentQueue(int index, long thresholdBytes, boolean hasMaxQueueSize) {
             this.index = index;
             this.thresholdBytes = thresholdBytes;
             this.hasMaxQueueSize = hasMaxQueueSize;
@@ -171,7 +172,7 @@ public abstract class BufferedQueue<T> extends AbstractQueue<T> {
         }
         
         abstract protected Queue<T> getInMemoryQueue();
-        abstract protected int sizeOf(T e);
+        abstract protected long sizeOf(T e);
         abstract protected void writeToStream(DataOutputStream out, T e) throws IOException;
         abstract protected T readFromStream(DataInputStream in) throws IOException;
         
@@ -296,13 +297,13 @@ public abstract class BufferedQueue<T> extends AbstractQueue<T> {
 
         private void flush(T entry) throws IOException {
             Queue<T> inMemQueue = getInMemoryQueue();
-            int resultSize = sizeOf(entry);
+            long resultSize = sizeOf(entry);
             maxResultSize = Math.max(maxResultSize, resultSize);
             totalResultSize = hasMaxQueueSize ? maxResultSize * inMemQueue.size() : (totalResultSize + resultSize);
             if (totalResultSize >= thresholdBytes) {
                 this.file = File.createTempFile(UUID.randomUUID().toString(), null);
                 try (DataOutputStream out = new DataOutputStream(
-                        new BufferedOutputStream(new FileOutputStream(file)))) {
+                        new BufferedOutputStream(Files.newOutputStream(file.toPath())))) {
                     int resSize = inMemQueue.size();
                     for (int i = 0; i < resSize; i++) {
                         T e = inMemQueue.poll();
@@ -340,7 +341,7 @@ public abstract class BufferedQueue<T> extends AbstractQueue<T> {
                 this.next = null;
                 try {
                     this.in = new DataInputStream(
-                            new BufferedInputStream(new FileInputStream(file)));
+                            new BufferedInputStream(Files.newInputStream(file.toPath())));
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }

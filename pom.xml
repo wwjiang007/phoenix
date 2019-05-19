@@ -24,12 +24,7 @@
 
   <modules>
     <module>phoenix-core</module>
-    <module>phoenix-flume</module>
-    <module>phoenix-kafka</module>
-    <module>phoenix-pig</module>
     <module>phoenix-pherf</module>
-    <module>phoenix-spark</module>
-    <module>phoenix-hive</module>
     <module>phoenix-client</module>
     <module>phoenix-server</module>
     <module>phoenix-assembly</module>
@@ -80,7 +75,7 @@
     <commons-lang.version>3.8</commons-lang.version>
     <commons-logging.version>1.2</commons-logging.version>
     <commons-csv.version>1.0</commons-csv.version>
-    <sqlline.version>1.2.0</sqlline.version>
+    <sqlline.version>1.7.0</sqlline.version>
     <guava.version>13.0.1</guava.version>
     <flume.version>1.4.0</flume.version>
     <kafka.version>0.9.0.0</kafka.version>
@@ -97,7 +92,7 @@
     <avatica.version>1.12.0</avatica.version>
     <jetty.version>9.3.19.v20170502</jetty.version>
     <tephra.version>0.15.0-incubating</tephra.version>
-    <omid.version>1.0.0</omid.version>
+    <omid.version>1.0.1</omid.version>
     <spark.version>2.4.0</spark.version>
     <scala.version>2.11.8</scala.version>
     <scala.binary.version>2.11</scala.binary.version>

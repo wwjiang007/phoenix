@@ -44,7 +44,16 @@ public interface QueryServices extends SQLCloseable {
     public static final String THREAD_POOL_SIZE_ATTRIB = "phoenix.query.threadPoolSize";
     public static final String QUEUE_SIZE_ATTRIB = "phoenix.query.queueSize";
     public static final String THREAD_TIMEOUT_MS_ATTRIB = "phoenix.query.timeoutMs";
-    public static final String SPOOL_THRESHOLD_BYTES_ATTRIB = "phoenix.query.spoolThresholdBytes";
+    public static final String SERVER_SPOOL_THRESHOLD_BYTES_ATTRIB =
+            "phoenix.query.server.spoolThresholdBytes";
+    public static final String CLIENT_SPOOL_THRESHOLD_BYTES_ATTRIB =
+            "phoenix.query.client.spoolThresholdBytes";
+    public static final String CLIENT_ORDERBY_SPOOLING_ENABLED_ATTRIB =
+            "phoenix.query.client.orderBy.spooling.enabled";
+    public static final String CLIENT_JOIN_SPOOLING_ENABLED_ATTRIB =
+            "phoenix.query.client.join.spooling.enabled";
+    public static final String SERVER_ORDERBY_SPOOLING_ENABLED_ATTRIB =
+            "phoenix.query.server.orderBy.spooling.enabled";
     public static final String HBASE_CLIENT_KEYTAB = "hbase.myclient.keytab";
     public static final String HBASE_CLIENT_PRINCIPAL = "hbase.myclient.principal";
     public static final String SPOOL_DIRECTORY = "phoenix.spool.directory";
@@ -357,6 +366,11 @@ public interface QueryServices extends SQLCloseable {
     // as from 4.15 onwards the PARENT->CHILD links are stored in a separate SYSTEM.CHILD_LINK table.
     public static final String ALLOW_SPLITTABLE_SYSTEM_CATALOG_ROLLBACK =
             "phoenix.allow.system.catalog.rollback";
+
+    // Phoenix parameter used to indicate what implementation is used for providing the client
+    // stats guide post cache.
+    // QueryServicesOptions.DEFAULT_GUIDE_POSTS_CACHE_FACTORY_CLASS is used if this is not provided
+    public static final String GUIDE_POSTS_CACHE_FACTORY_CLASS = "phoenix.guide.posts.cache.factory.class";
 
     /**
      * Get executor service used for parallel scans

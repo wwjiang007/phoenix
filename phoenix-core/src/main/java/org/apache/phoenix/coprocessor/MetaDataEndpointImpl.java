@@ -76,6 +76,7 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_INDEX_ID_DATA
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_STATEMENT_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_TYPE_BYTES;
 import static org.apache.phoenix.query.QueryConstants.DIVERGED_VIEW_BASE_COLUMN_COUNT;
+import static org.apache.phoenix.query.QueryConstants.VIEW_MODIFIED_PROPERTY_TAG_TYPE;
 import static org.apache.phoenix.schema.PTableType.INDEX;
 import static org.apache.phoenix.schema.PTableType.TABLE;
 import static org.apache.phoenix.schema.PTableImpl.getColumnsToClone;
@@ -102,6 +103,7 @@ import java.util.Properties;
 import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.ArrayBackedTag;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellComparatorImpl;
 import org.apache.hadoop.hbase.CellUtil;
@@ -113,6 +115,7 @@ import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValue.Type;
 import org.apache.hadoop.hbase.KeyValueUtil;
 import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.Tag;
 import org.apache.hadoop.hbase.TagUtil;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Get;
@@ -227,6 +230,7 @@ import org.apache.phoenix.schema.SequenceNotFoundException;
 import org.apache.phoenix.schema.SortOrder;
 import org.apache.phoenix.schema.TableNotFoundException;
 import org.apache.phoenix.schema.TableRef;
+import org.apache.phoenix.schema.task.Task;
 import org.apache.phoenix.schema.types.PBinary;
 import org.apache.phoenix.schema.types.PBoolean;
 import org.apache.phoenix.schema.types.PDataType;
@@ -468,8 +472,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
     private static final int LINK_TYPE_INDEX = 0;
     // Used to add a tag to a cell when a view modifies a table property to indicate that this
     // property should not be derived from the base table
-    private static final byte[] VIEW_MODIFIED_PROPERTY_BYTES = Bytes.toBytes(1);
-
+    public static final byte[] VIEW_MODIFIED_PROPERTY_BYTES = TagUtil.fromList(ImmutableList.<Tag>of(new ArrayBackedTag(VIEW_MODIFIED_PROPERTY_TAG_TYPE, Bytes.toBytes(1))));
     private static final Cell CLASS_NAME_KV = createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, CLASS_NAME_BYTES);
     private static final Cell JAR_PATH_KV = createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, JAR_PATH_BYTES);
     private static final Cell RETURN_TYPE_KV = createFirstOnRow(ByteUtil.EMPTY_BYTE_ARRAY, TABLE_FAMILY_BYTES, RETURN_TYPE_BYTES);
@@ -2362,26 +2365,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                     String tenantIdStr = tenantIdBytes.length == 0 ? null : Bytes.toString(tenantIdBytes);
                     try (PhoenixConnection connection = QueryUtil.getConnectionOnServer(env.getConfiguration()).unwrap(PhoenixConnection.class)) {
                         PName physicalName = parentTable.getPhysicalName();
-                        int nSequenceSaltBuckets = connection.getQueryServices().getSequenceSaltBuckets();
-                        SequenceKey key = MetaDataUtil.getViewIndexSequenceKey(tenantIdStr, physicalName,
-                            nSequenceSaltBuckets, parentTable.isNamespaceMapped() );
-                        // TODO Review Earlier sequence was created at (SCN-1/LATEST_TIMESTAMP) and incremented at the client max(SCN,dataTable.getTimestamp), but it seems we should
-                        // use always LATEST_TIMESTAMP to avoid seeing wrong sequence values by different connection having SCN
-                        // or not.
-                        long sequenceTimestamp = HConstants.LATEST_TIMESTAMP;
-                        try {
-                            connection.getQueryServices().createSequence(key.getTenantId(), key.getSchemaName(), key.getSequenceName(),
-                                Long.MIN_VALUE, 1, 1, Long.MIN_VALUE, Long.MAX_VALUE, false, sequenceTimestamp);
-                        } catch (SequenceAlreadyExistsException e) {
-                        }
-                        long[] seqValues = new long[1];
-                        SQLException[] sqlExceptions = new SQLException[1];
-                        connection.getQueryServices().incrementSequences(Collections.singletonList(new SequenceAllocation(key, 1)),
-                            HConstants.LATEST_TIMESTAMP, seqValues, sqlExceptions);
-                        if (sqlExceptions[0] != null) {
-                            throw sqlExceptions[0];
-                        }
-                        long seqValue = seqValues[0];
+                        long seqValue = getViewIndexSequenceValue(connection, tenantIdStr, parentTable, physicalName);
                         Put tableHeaderPut = MetaDataUtil.getPutOnlyTableHeaderRow(tableMetadata);
 
                         NavigableMap<byte[], List<Cell>> familyCellMap = tableHeaderPut.getFamilyCellMap();
@@ -2499,6 +2483,33 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
             ProtobufUtil.setControllerException(controller,
                     ServerUtil.createIOException(fullTableName, t));
         }
+    }
+
+    private long getViewIndexSequenceValue(PhoenixConnection connection, String tenantIdStr, PTable parentTable, PName physicalName) throws SQLException {
+        int nSequenceSaltBuckets = connection.getQueryServices().getSequenceSaltBuckets();
+
+        SequenceKey key = MetaDataUtil.getViewIndexSequenceKey(tenantIdStr, physicalName,
+            nSequenceSaltBuckets, parentTable.isNamespaceMapped() );
+        // Earlier sequence was created at (SCN-1/LATEST_TIMESTAMP) and incremented at the client max(SCN,dataTable.getTimestamp), but it seems we should
+        // use always LATEST_TIMESTAMP to avoid seeing wrong sequence values by different connection having SCN
+        // or not.
+        long sequenceTimestamp = HConstants.LATEST_TIMESTAMP;
+        try {
+            connection.getQueryServices().createSequence(key.getTenantId(), key.getSchemaName(), key.getSequenceName(),
+                Long.MIN_VALUE, 1, 1, Long.MIN_VALUE, Long.MAX_VALUE, false, sequenceTimestamp);
+        } catch (SequenceAlreadyExistsException e) {
+            //someone else got here first and created the sequence, or it was pre-existing. Not a problem.
+        }
+
+
+        long[] seqValues = new long[1];
+        SQLException[] sqlExceptions = new SQLException[1];
+        connection.getQueryServices().incrementSequences(Collections.singletonList(new SequenceAllocation(key, 1)),
+            HConstants.LATEST_TIMESTAMP, seqValues, sqlExceptions);
+        if (sqlExceptions[0] != null) {
+            throw sqlExceptions[0];
+        }
+        return seqValues[0];
     }
 
     public static void dropChildViews(RegionCoprocessorEnvironment env, byte[] tenantIdBytes, byte[] schemaName, byte[] tableName)
@@ -2837,7 +2848,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                         }
                         try {
                             PhoenixConnection conn = QueryUtil.getConnectionOnServer(env.getConfiguration()).unwrap(PhoenixConnection.class);
-                            TaskRegionObserver.addTask(conn, PTable.TaskType.DROP_CHILD_VIEWS, Bytes.toString(tenantId),
+                            Task.addTask(conn, PTable.TaskType.DROP_CHILD_VIEWS, Bytes.toString(tenantId),
                                 Bytes.toString(schemaName), Bytes.toString(tableName), this.accessCheckEnabled);
                         } catch (Throwable t) {
                             logger.error("Adding a task to drop child views failed!", t);

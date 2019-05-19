@@ -27,8 +27,8 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.sql.SQLException;
 import java.util.List;
 
@@ -95,7 +95,8 @@ public class SpoolingResultIterator implements PeekingResultIterator {
 
     private SpoolingResultIterator(SpoolingMetricsHolder spoolMetrics, MemoryMetricsHolder memoryMetrics, ResultIterator scanner, QueryServices services) throws SQLException {
         this (spoolMetrics, memoryMetrics, scanner, services.getMemoryManager(),
-                services.getProps().getInt(QueryServices.SPOOL_THRESHOLD_BYTES_ATTRIB, QueryServicesOptions.DEFAULT_SPOOL_THRESHOLD_BYTES),
+                services.getProps().getLong(QueryServices.CLIENT_SPOOL_THRESHOLD_BYTES_ATTRIB,
+                    QueryServicesOptions.DEFAULT_CLIENT_SPOOL_THRESHOLD_BYTES),
                 services.getProps().getLong(QueryServices.MAX_SPOOL_TO_DISK_BYTES_ATTRIB, QueryServicesOptions.DEFAULT_MAX_SPOOL_TO_DISK_BYTES),
                 services.getProps().get(QueryServices.SPOOL_DIRECTORY, QueryServicesOptions.DEFAULT_SPOOL_DIRECTORY));
     }
@@ -109,7 +110,7 @@ public class SpoolingResultIterator implements PeekingResultIterator {
     *  the memory manager) is exceeded.
     * @throws SQLException
     */
-    SpoolingResultIterator(SpoolingMetricsHolder sMetrics, MemoryMetricsHolder mMetrics, ResultIterator scanner, MemoryManager mm, final int thresholdBytes, final long maxSpoolToDisk, final String spoolDirectory) throws SQLException {
+    SpoolingResultIterator(SpoolingMetricsHolder sMetrics, MemoryMetricsHolder mMetrics, ResultIterator scanner, MemoryManager mm, final long thresholdBytes, final long maxSpoolToDisk, final String spoolDirectory) throws SQLException {
         this.spoolMetrics = sMetrics;
         this.memoryMetrics = mMetrics;
         boolean success = false;
@@ -272,7 +273,7 @@ public class SpoolingResultIterator implements PeekingResultIterator {
 
         private synchronized void init() throws IOException {
             if (spoolFrom == null) {
-                spoolFrom = new DataInputStream(new BufferedInputStream(new FileInputStream(file)));
+                spoolFrom = new DataInputStream(new BufferedInputStream(Files.newInputStream(file.toPath())));
                 advance();
             }
         }

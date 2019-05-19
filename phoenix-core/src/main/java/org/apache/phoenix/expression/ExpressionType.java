@@ -187,6 +187,10 @@ public enum ExpressionType {
     CollationKeyFunction(CollationKeyFunction.class),
     ArrayRemoveFunction(ArrayRemoveFunction.class),
     TransactionProviderNameFunction(TransactionProviderNameFunction.class),
+    MathPIFunction(MathPIFunction.class),
+    SinFunction(SinFunction.class),
+    CosFunction(CosFunction.class),
+    TanFunction(TanFunction.class),
     ;
 
     ExpressionType(Class<? extends Expression> clazz) {
