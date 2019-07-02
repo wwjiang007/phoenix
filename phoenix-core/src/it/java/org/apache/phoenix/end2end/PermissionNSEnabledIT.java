@@ -1,12 +1,39 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package org.apache.phoenix.end2end;
 
+import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.security.AccessDeniedException;
 import org.apache.hadoop.hbase.security.access.AccessControlClient;
 import org.apache.hadoop.hbase.security.access.Permission;
+import org.apache.phoenix.exception.SQLExceptionCode;
+import org.apache.phoenix.util.SchemaUtil;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.security.PrivilegedExceptionAction;
+import java.sql.Connection;
+import java.sql.SQLException;
+
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CATALOG_TABLE;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_SCHEMA_NAME;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class PermissionNSEnabledIT extends BasePermissionsIT {
 
@@ -46,6 +73,45 @@ public class PermissionNSEnabledIT extends BasePermissionsIT {
             verifyDenied(createSchema(schemaName), AccessDeniedException.class, unprivilegedUser);
 
             verifyAllowed(dropSchema(schemaName), regularUser1);
+        } finally {
+            revokeAll();
+        }
+    }
+
+    @Test
+    public void testConnectionCreationFailsWhenNoExecPermsOnSystemCatalog() throws Throwable {
+        try {
+            grantSystemTableAccess();
+            superUser1.runAs((PrivilegedExceptionAction<Object>) () -> {
+                TableName systemCatalogTableName =
+                        TableName.valueOf(SchemaUtil.getPhysicalHBaseTableName(
+                                SYSTEM_SCHEMA_NAME, SYSTEM_CATALOG_TABLE, true).getString());
+                try {
+                    // Revoke Exec permissions for SYSTEM CATALOG for the unprivileged user
+                    AccessControlClient.revoke(getUtility().getConnection(), systemCatalogTableName,
+                            unprivilegedUser.getShortName(), null, null, Permission.Action.EXEC);
+                } catch (Throwable t) {
+                    if (t instanceof Exception) {
+                        throw (Exception)t;
+                    } else {
+                        throw new Exception(t);
+                    }
+                }
+                return null;
+            });
+            unprivilegedUser.runAs((PrivilegedExceptionAction<Void>) () -> {
+                try (Connection ignored = getConnection()) {
+                    // We expect this to throw a wrapped AccessDeniedException.
+                    fail("Should have failed with a wrapped AccessDeniedException");
+                } catch (Throwable ex) {
+                    assertTrue("Should not get an incompatible jars exception",
+                            ex instanceof SQLException && ((SQLException)ex).getErrorCode() !=
+                                    SQLExceptionCode.INCOMPATIBLE_CLIENT_SERVER_JAR.getErrorCode());
+                    assertTrue("Expected a wrapped AccessDeniedException",
+                            ex.getCause() instanceof AccessDeniedException);
+                }
+                return null;
+            });
         } finally {
             revokeAll();
         }

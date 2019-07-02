@@ -70,7 +70,6 @@ public class IndexToolForDeleteBeforeRebuildIT extends ParallelStatsDisabledIT {
             INDEX_LOCAL_DDL = "CREATE LOCAL INDEX %s ON %s (ZIP) INCLUDE (NAME)";
     private static final String UPSERT_SQL = "UPSERT INTO %s VALUES(?,?,?,?)";
 
-
     @BeforeClass
     public static void setup() throws Exception {
         Map<String, String> serverProps = Maps.newHashMapWithExpectedSize(3);

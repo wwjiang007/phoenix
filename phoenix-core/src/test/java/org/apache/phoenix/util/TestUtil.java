@@ -52,8 +52,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Properties;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellScanner;
 import org.apache.hadoop.hbase.HConstants;
@@ -128,6 +126,8 @@ import org.apache.phoenix.schema.stats.GuidePostsKey;
 import org.apache.phoenix.schema.tuple.Tuple;
 import org.apache.phoenix.schema.types.PDataType;
 import org.apache.phoenix.transaction.TransactionFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Objects;
 import com.google.common.collect.Lists;
@@ -135,7 +135,7 @@ import com.google.common.collect.Lists;
 
 
 public class TestUtil {
-    private static final Log LOG = LogFactory.getLog(TestUtil.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(TestUtil.class);
     
     private static final Long ZERO = new Long(0);
     public static final String DEFAULT_SCHEMA_NAME = "S";
@@ -830,11 +830,11 @@ public class TestUtil {
                 try (Table htableForRawScan = services.getTable(Bytes.toBytes(tableName))) {
                     ResultScanner scanner = htableForRawScan.getScanner(scan);
                     List<Result> results = Lists.newArrayList(scanner);
-                    LOG.info("Results: " + results);
+                    LOGGER.info("Results: " + results);
                     compactionDone = results.isEmpty();
                     scanner.close();
                 }
-                LOG.info("Compaction done: " + compactionDone);
+                LOGGER.info("Compaction done: " + compactionDone);
                 
                 // need to run compaction after the next txn snapshot has been written so that compaction can remove deleted rows
                 if (!compactionDone && table.isTransactional()) {
@@ -875,8 +875,12 @@ public class TestUtil {
     }
 
     public static int getRawRowCount(Table table) throws IOException {
+        return getRowCount(table, true);
+    }
+
+    public static int getRowCount(Table table, boolean isRaw) throws IOException {
         Scan s = new Scan();
-        s.setRaw(true);;
+        s.setRaw(isRaw);;
         s.setMaxVersions();
         int rows = 0;
         try (ResultScanner scanner = table.getScanner(s)) {
@@ -934,7 +938,31 @@ public class TestUtil {
     		this.success = success;
     	}
     }
-    
+
+    public static void waitForIndexState(Connection conn, String fullIndexName, PIndexState expectedIndexState) throws InterruptedException, SQLException {
+        int maxTries = 60, nTries = 0;
+        PIndexState actualIndexState = null;
+        do {
+            String schema = SchemaUtil.getSchemaNameFromFullName(fullIndexName);
+            String index = SchemaUtil.getTableNameFromFullName(fullIndexName);
+            Thread.sleep(1000); // sleep 1 sec
+            String query = "SELECT " + PhoenixDatabaseMetaData.INDEX_STATE + " FROM " +
+                    PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME + " WHERE (" + PhoenixDatabaseMetaData.TABLE_SCHEM + "," + PhoenixDatabaseMetaData.TABLE_NAME
+                    + ") = (" + "'" + schema + "','" + index + "') "
+                    + "AND " + PhoenixDatabaseMetaData.COLUMN_FAMILY + " IS NULL AND " + PhoenixDatabaseMetaData.COLUMN_NAME + " IS NULL";
+            ResultSet rs = conn.createStatement().executeQuery(query);
+            if (rs.next()) {
+                actualIndexState = PIndexState.fromSerializedValue(rs.getString(1));
+                boolean matchesExpected = (actualIndexState == expectedIndexState);
+                if (matchesExpected) {
+                    return;
+                }
+            }
+        } while (++nTries < maxTries);
+        fail("Ran out of time waiting for index state to become " + expectedIndexState + " last seen actual state is " +
+                (actualIndexState == null ? "Unknown" : actualIndexState.toString()));
+    }
+
     public static void waitForIndexState(Connection conn, String fullIndexName, PIndexState expectedIndexState, Long expectedIndexDisableTimestamp) throws InterruptedException, SQLException {
         int maxTries = 60, nTries = 0;
         do {

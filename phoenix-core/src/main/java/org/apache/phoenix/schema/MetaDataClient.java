@@ -19,8 +19,9 @@ package org.apache.phoenix.schema;
 
 import static com.google.common.collect.Sets.newLinkedHashSet;
 import static com.google.common.collect.Sets.newLinkedHashSetWithExpectedSize;
-import static org.apache.phoenix.coprocessor.BaseScannerRegionObserver.ANALYZE_TABLE;
 import static org.apache.phoenix.coprocessor.BaseScannerRegionObserver.RUN_UPDATE_STATS_ASYNC_ATTRIB;
+import static org.apache.phoenix.coprocessor.tasks.IndexRebuildTask.INDEX_NAME;
+import static org.apache.phoenix.coprocessor.tasks.IndexRebuildTask.REBUILD_ALL;
 import static org.apache.phoenix.exception.SQLExceptionCode.INSUFFICIENT_MULTI_TENANT_COLUMNS;
 import static org.apache.phoenix.exception.SQLExceptionCode.PARENT_TABLE_NOT_FOUND;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.APPEND_ONLY_SCHEMA;
@@ -98,7 +99,6 @@ import static org.apache.phoenix.query.QueryConstants.ENCODED_CQ_COUNTER_INITIAL
 import static org.apache.phoenix.query.QueryServices.DROP_METADATA_ATTRIB;
 import static org.apache.phoenix.query.QueryServicesOptions.DEFAULT_DROP_METADATA;
 import static org.apache.phoenix.query.QueryServicesOptions.DEFAULT_RUN_UPDATE_STATS_ASYNC;
-import static org.apache.phoenix.query.QueryServicesOptions.DEFAULT_USE_STATS_FOR_PARALLELIZATION;
 import static org.apache.phoenix.schema.PTable.EncodedCQCounter.NULL_COUNTER;
 import static org.apache.phoenix.schema.PTable.ImmutableStorageScheme.ONE_CELL_PER_COLUMN;
 import static org.apache.phoenix.schema.PTable.ImmutableStorageScheme.SINGLE_CELL_ARRAY_WITH_OFFSETS;
@@ -116,6 +116,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -133,6 +134,7 @@ import java.util.Properties;
 import java.util.Set;
 
 import com.google.common.base.Objects;
+import com.google.gson.JsonObject;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.ClusterConnection;
@@ -159,7 +161,6 @@ import org.apache.phoenix.compile.QueryPlan;
 import org.apache.phoenix.compile.ServerBuildIndexCompiler;
 import org.apache.phoenix.compile.StatementContext;
 import org.apache.phoenix.compile.StatementNormalizer;
-import org.apache.phoenix.coprocessor.BaseScannerRegionObserver;
 import org.apache.phoenix.coprocessor.MetaDataProtocol;
 import org.apache.phoenix.coprocessor.MetaDataProtocol.MetaDataMutationResult;
 import org.apache.phoenix.coprocessor.MetaDataProtocol.MutationCode;
@@ -220,9 +221,9 @@ import org.apache.phoenix.schema.PTable.QualifierEncodingScheme.QualifierOutOfRa
 import org.apache.phoenix.schema.PTable.ViewType;
 import org.apache.phoenix.schema.stats.GuidePostsKey;
 import org.apache.phoenix.schema.stats.StatisticsUtil;
+import org.apache.phoenix.schema.task.Task;
 import org.apache.phoenix.schema.types.PDataType;
 import org.apache.phoenix.schema.types.PDate;
-import org.apache.phoenix.schema.types.PInteger;
 import org.apache.phoenix.schema.types.PLong;
 import org.apache.phoenix.schema.types.PTimestamp;
 import org.apache.phoenix.schema.types.PUnsignedLong;
@@ -260,7 +261,7 @@ import com.google.common.collect.Sets;
 import com.google.common.primitives.Ints;
 
 public class MetaDataClient {
-    private static final Logger logger = LoggerFactory.getLogger(MetaDataClient.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(MetaDataClient.class);
 
     private static final ParseNodeFactory FACTORY = new ParseNodeFactory();
     private static final String SET_ASYNC_CREATED_DATE =
@@ -1729,7 +1730,7 @@ public class MetaDataClient {
             return new MutationState(0, 0, connection);
         }
 
-        if (logger.isInfoEnabled()) logger.info("Created index " + table.getName().getString() + " at " + table.getTimeStamp());
+        if (LOGGER.isInfoEnabled()) LOGGER.info("Created index " + table.getName().getString() + " at " + table.getTimeStamp());
         boolean asyncIndexBuildEnabled = connection.getQueryServices().getProps().getBoolean(
                 QueryServices.INDEX_ASYNC_BUILD_ENABLED,
                 QueryServicesOptions.DEFAULT_INDEX_ASYNC_BUILD_ENABLED);
@@ -3334,8 +3335,8 @@ public class MetaDataClient {
             break;
         case CONCURRENT_TABLE_MUTATION:
             addTableToCache(result);
-            if (logger.isDebugEnabled()) {
-                logger.debug(LogUtil.addCustomAnnotations("CONCURRENT_TABLE_MUTATION for table " + SchemaUtil.getTableName(schemaName, tableName), connection));
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug(LogUtil.addCustomAnnotations("CONCURRENT_TABLE_MUTATION for table " + SchemaUtil.getTableName(schemaName, tableName), connection));
             }
             throw new ConcurrentTableMutationException(schemaName, tableName);
         case NEWER_TABLE_FOUND:
@@ -3586,21 +3587,22 @@ public class MetaDataClient {
                 int nNewColumns = numCols;
                 List<Mutation> tableMetaData = Lists.newArrayListWithExpectedSize((1 + nNewColumns) * (nIndexes + 1));
                 List<Mutation> columnMetaData = Lists.newArrayListWithExpectedSize(nNewColumns * (nIndexes + 1));
-                if (logger.isDebugEnabled()) {
-                    logger.debug(LogUtil.addCustomAnnotations("Resolved table to " + table.getName().getString() + " with seqNum " + table.getSequenceNumber() + " at timestamp " + table.getTimeStamp() + " with " + table.getColumns().size() + " columns: " + table.getColumns(), connection));
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug(LogUtil.addCustomAnnotations("Resolved table to " + table.getName().getString() + " with seqNum " + table.getSequenceNumber() + " at timestamp " + table.getTimeStamp() + " with " + table.getColumns().size() + " columns: " + table.getColumns(), connection));
                 }
 
                 int position = table.getColumns().size();
 
-                List<PColumn> currentPKs = table.getPKColumns();
-                if (numCols > 0) {
+                boolean addPKColumns = columnDefs.stream().anyMatch(ColumnDef::isPK);
+                if (addPKColumns) {
+                    List<PColumn> currentPKs = table.getPKColumns();
                     PColumn lastPK = currentPKs.get(currentPKs.size()-1);
-                    // Disallow adding columns if the last column is VARBIANRY.
+                    // Disallow adding columns if the last column in the primary key is VARBIANRY or ARRAY.
                     if (lastPK.getDataType() == PVarbinary.INSTANCE || lastPK.getDataType().isArrayType()) {
                         throw new SQLExceptionInfo.Builder(SQLExceptionCode.VARBINARY_LAST_PK)
                         .setColumnName(lastPK.getName().getString()).build().buildException();
                     }
-                    // Disallow adding columns if last column is fixed width and nullable.
+                    // Disallow adding columns if last column in the primary key is fixed width and nullable.
                     if (lastPK.isNullable() && lastPK.getDataType().isFixedWidth()) {
                         throw new SQLExceptionInfo.Builder(SQLExceptionCode.NULLABLE_FIXED_WIDTH_LAST_PK)
                         .setColumnName(lastPK.getName().getString()).build().buildException();
@@ -3916,8 +3918,8 @@ public class MetaDataClient {
                     if (retried) {
                         throw e;
                     }
-                    if (logger.isDebugEnabled()) {
-                        logger.debug(LogUtil.addCustomAnnotations("Caught ConcurrentTableMutationException for table " + SchemaUtil.getTableName(schemaName, tableName) + ". Will try again...", connection));
+                    if (LOGGER.isDebugEnabled()) {
+                        LOGGER.debug(LogUtil.addCustomAnnotations("Caught ConcurrentTableMutationException for table " + SchemaUtil.getTableName(schemaName, tableName) + ". Will try again...", connection));
                     }
                     retried = true;
                 }
@@ -4288,6 +4290,7 @@ public class MetaDataClient {
             String dataTableName = statement.getTableName();
             String indexName = statement.getTable().getName().getTableName();
             boolean isAsync = statement.isAsync();
+            boolean isRebuildAll = statement.isRebuildAll();
             String tenantId = connection.getTenantId() == null ? null : connection.getTenantId().getString();
             PTable table = FromCompiler.getIndexResolver(statement, connection)
                     .getTables().get(0).getTable();
@@ -4302,6 +4305,7 @@ public class MetaDataClient {
             boolean changingPhoenixTableProperty= evaluateStmtProperties(metaProperties,metaPropertiesEvaluated,table,schemaName,tableName);
 
             PIndexState newIndexState = statement.getIndexState();
+
             if (isAsync && newIndexState != PIndexState.REBUILD) { throw new SQLExceptionInfo.Builder(
                     SQLExceptionCode.ASYNC_NOT_ALLOWED)
                             .setMessage(" ASYNC building of index is allowed only with REBUILD index state")
@@ -4362,18 +4366,40 @@ public class MetaDataClient {
                     // Set so that we get the table below with the potentially modified rowKeyOrderOptimizable flag set
                     indexRef.setTable(result.getTable());
                     if (newIndexState == PIndexState.BUILDING && isAsync) {
-                        try {
-                            tableUpsert = connection.prepareStatement(UPDATE_INDEX_REBUILD_ASYNC_STATE);
-                            tableUpsert.setString(1,
-                                    connection.getTenantId() == null ? null : connection.getTenantId().getString());
-                            tableUpsert.setString(2, schemaName);
-                            tableUpsert.setString(3, indexName);
-                            tableUpsert.setLong(4, result.getTable().getTimeStamp());
-                            tableUpsert.execute();
-                            connection.commit();
-                        } finally {
-                            if (tableUpsert != null) {
-                                tableUpsert.close();
+                        if (isRebuildAll) {
+                            List<Task.TaskRecord> tasks = Task.queryTaskTable(connection, schemaName, tableName, PTable.TaskType.INDEX_REBUILD,
+                                    tenantId, indexName);
+                            if (tasks == null || tasks.size() == 0) {
+                                Timestamp ts = new Timestamp(EnvironmentEdgeManager.currentTimeMillis());
+                                JsonObject jsonObject = new JsonObject();
+                                jsonObject.addProperty(INDEX_NAME, indexName);
+                                jsonObject.addProperty(REBUILD_ALL, true);
+                                try {
+                                    Task.addTask(connection, PTable.TaskType.INDEX_REBUILD,
+                                            tenantId, schemaName,
+                                            dataTableName, PTable.TaskStatus.CREATED.toString(),
+                                            jsonObject.toString(), null, ts, null, true);
+                                    connection.commit();
+                                } catch (IOException e) {
+                                    throw new SQLException("Exception happened while adding a System.Task" + e.toString());
+                                }
+                            }
+                        } else {
+                            try {
+                                tableUpsert = connection.prepareStatement(UPDATE_INDEX_REBUILD_ASYNC_STATE);
+                                tableUpsert.setString(1, connection.getTenantId() == null ?
+                                        null :
+                                        connection.getTenantId().getString());
+                                tableUpsert.setString(2, schemaName);
+                                tableUpsert.setString(3, indexName);
+                                long beginTimestamp = result.getTable().getTimeStamp();
+                                tableUpsert.setLong(4, beginTimestamp);
+                                tableUpsert.execute();
+                                connection.commit();
+                            } finally {
+                                if (tableUpsert != null) {
+                                    tableUpsert.close();
+                                }
                             }
                         }
                     }
@@ -4944,7 +4970,7 @@ public class MetaDataClient {
      */
     public MutationState changePermissions(ChangePermsStatement changePermsStatement) throws SQLException {
 
-        logger.info(changePermsStatement.toString());
+        LOGGER.info(changePermsStatement.toString());
 
         try(Admin admin = connection.getQueryServices().getAdmin()) {
             ClusterConnection clusterConnection = (ClusterConnection) admin.getConnection();
@@ -5015,7 +5041,7 @@ public class MetaDataClient {
                 inconsistentTables.add(indexTable);
                 continue;
             }
-            logger.info("Updating permissions for Index Table: " +
+            LOGGER.info("Updating permissions for Index Table: " +
                     indexTable.getName() + " Base Table: " + inputTable.getName());
             tableName = SchemaUtil.getPhysicalTableName(indexTable.getPhysicalName().getBytes(), indexTable.isNamespaceMapped());
             changePermsOnTable(clusterConnection, changePermsStatement, tableName);
@@ -5023,7 +5049,7 @@ public class MetaDataClient {
 
         if(schemaInconsistency) {
             for(PTable table : inconsistentTables) {
-                logger.error("Fail to propagate permissions to Index Table: " + table.getName());
+                LOGGER.error("Fail to propagate permissions to Index Table: " + table.getName());
             }
             throw new TablesNotInSyncException(inputTable.getTableName().getString(),
                     inconsistentTables.get(0).getTableName().getString(), "Namespace properties");
@@ -5034,13 +5060,13 @@ public class MetaDataClient {
         tableName = org.apache.hadoop.hbase.TableName.valueOf(viewIndexTableBytes);
         boolean viewIndexTableExists = admin.tableExists(tableName);
         if(viewIndexTableExists) {
-            logger.info("Updating permissions for View Index Table: " +
+            LOGGER.info("Updating permissions for View Index Table: " +
                     Bytes.toString(viewIndexTableBytes) + " Base Table: " + inputTable.getName());
             changePermsOnTable(clusterConnection, changePermsStatement, tableName);
         } else {
             if(inputTable.isMultiTenant()) {
-                logger.error("View Index Table not found for MultiTenant Table: " + inputTable.getName());
-                logger.error("Fail to propagate permissions to view Index Table: " + tableName.getNameAsString());
+                LOGGER.error("View Index Table not found for MultiTenant Table: " + inputTable.getName());
+                LOGGER.error("Fail to propagate permissions to view Index Table: " + tableName.getNameAsString());
                 throw new TablesNotInSyncException(inputTable.getTableName().getString(),
                         Bytes.toString(viewIndexTableBytes), " View Index table should exist for MultiTenant tables");
             }

@@ -1,10 +1,25 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package org.apache.phoenix.coprocessor.tasks;
 
 import com.google.common.base.Strings;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.mapreduce.Cluster;
@@ -16,6 +31,8 @@ import org.apache.phoenix.query.QueryServices;
 import org.apache.phoenix.schema.PTable;
 import org.apache.phoenix.schema.task.Task;
 import org.apache.phoenix.util.QueryUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -26,9 +43,12 @@ import java.util.Map;
  *
  */
 public class IndexRebuildTask extends BaseTask  {
-    public static final String IndexName = "IndexName";
-    public static final String JobID = "JobID";
-    public static final Log LOG = LogFactory.getLog(IndexRebuildTask.class);
+    public static final String INDEX_NAME = "IndexName";
+    public static final String JOB_ID = "JobID";
+    public static final String DISABLE_BEFORE = "DisableBefore";
+    public static final String REBUILD_ALL = "RebuildAll";
+
+    public static final Logger LOGGER = LoggerFactory.getLogger(IndexRebuildTask.class);
 
     @Override
     public TaskRegionObserver.TaskResult run(Task.TaskRecord taskRecord) {
@@ -51,15 +71,23 @@ public class IndexRebuildTask extends BaseTask  {
             if (Strings.isNullOrEmpty(indexName)) {
                 String str = "Index name is not found. Index rebuild cannot continue " +
                         "Data : " + data;
-                LOG.warn(str);
+                LOGGER.warn(str);
                 return new TaskRegionObserver.TaskResult(TaskRegionObserver.TaskResultCode.FAIL, str);
             }
 
             boolean shouldDisable = false;
-            if (jsonObject.has("DisableBefore")) {
-                String disableBefore = jsonObject.get("DisableBefore").toString();
+            if (jsonObject.has(DISABLE_BEFORE)) {
+                String disableBefore = jsonObject.get(DISABLE_BEFORE).toString();
                 if (!Strings.isNullOrEmpty(disableBefore)) {
                     shouldDisable = Boolean.valueOf(disableBefore);
+                }
+            }
+
+            boolean rebuildAll = false;
+            if (jsonObject.has(REBUILD_ALL)) {
+                String rebuildAllStr = jsonObject.get(REBUILD_ALL).toString();
+                if (!Strings.isNullOrEmpty(rebuildAllStr)) {
+                    rebuildAll = Boolean.valueOf(rebuildAllStr);
                 }
             }
 
@@ -67,7 +95,7 @@ public class IndexRebuildTask extends BaseTask  {
             boolean runForeground = false;
             Map.Entry<Integer, Job> indexToolRes = IndexTool
                     .run(conf, taskRecord.getSchemaName(), taskRecord.getTableName(), indexName, true,
-                            false, taskRecord.getTenantId(), shouldDisable, runForeground);
+                            false, taskRecord.getTenantId(), shouldDisable, rebuildAll, runForeground);
             int status = indexToolRes.getKey();
             if (status != 0) {
                 return new TaskRegionObserver.TaskResult(TaskRegionObserver.TaskResultCode.FAIL, "Index tool returned : " + status);
@@ -75,7 +103,7 @@ public class IndexRebuildTask extends BaseTask  {
 
             Job job = indexToolRes.getValue();
 
-            jsonObject.addProperty(JobID, job.getJobID().toString());
+            jsonObject.addProperty(JOB_ID, job.getJobID().toString());
             Task.addTask(conn.unwrap(PhoenixConnection.class ), taskRecord.getTaskType(), taskRecord.getTenantId(), taskRecord.getSchemaName(),
                     taskRecord.getTableName(), PTable.TaskStatus.STARTED.toString(), jsonObject.toString(), taskRecord.getPriority(),
                     taskRecord.getTimeStamp(), null, true);
@@ -83,7 +111,7 @@ public class IndexRebuildTask extends BaseTask  {
             return null;
         }
         catch (Throwable t) {
-            LOG.warn("Exception while running index rebuild task. " +
+            LOGGER.warn("Exception while running index rebuild task. " +
                     "It will be retried in the next system task table scan : " +
                     taskRecord.getSchemaName() + "." + taskRecord.getTableName() +
                     " with tenant id " + (taskRecord.getTenantId() == null ? " IS NULL" : taskRecord.getTenantId()) +
@@ -94,7 +122,7 @@ public class IndexRebuildTask extends BaseTask  {
                 try {
                     conn.close();
                 } catch (SQLException e) {
-                    LOG.debug("IndexRebuildTask can't close connection");
+                    LOGGER.debug("IndexRebuildTask can't close connection");
                 }
             }
         }
@@ -104,8 +132,8 @@ public class IndexRebuildTask extends BaseTask  {
     private String getIndexName(JsonObject jsonObject) {
         String indexName = null;
         // Get index name from data column.
-        if (jsonObject.has(IndexName)) {
-            indexName = jsonObject.get(IndexName).toString().replaceAll("\"", "");
+        if (jsonObject.has(INDEX_NAME)) {
+            indexName = jsonObject.get(INDEX_NAME).toString().replaceAll("\"", "");
         }
         return indexName;
     }
@@ -117,8 +145,8 @@ public class IndexRebuildTask extends BaseTask  {
         JsonParser jsonParser = new JsonParser();
         JsonObject jsonObject = jsonParser.parse(data).getAsJsonObject();
         String jobId = null;
-        if (jsonObject.has(JobID)) {
-            jobId = jsonObject.get(JobID).toString().replaceAll("\"", "");
+        if (jsonObject.has(JOB_ID)) {
+            jobId = jsonObject.get(JOB_ID).toString().replaceAll("\"", "");
         }
         return jobId;
     }
@@ -137,7 +165,7 @@ public class IndexRebuildTask extends BaseTask  {
 
             if (job != null && job.isComplete()) {
                 if (job.isSuccessful()) {
-                    LOG.warn("IndexRebuildTask checkCurrentResult job is successful " + taskRecord.getTableName());
+                    LOGGER.warn("IndexRebuildTask checkCurrentResult job is successful " + taskRecord.getTableName());
                     return new TaskRegionObserver.TaskResult(TaskRegionObserver.TaskResultCode.SUCCESS, "");
                 } else {
                     return new TaskRegionObserver.TaskResult(TaskRegionObserver.TaskResultCode.FAIL,
