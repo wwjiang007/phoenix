@@ -90,6 +90,8 @@ import org.apache.phoenix.mapreduce.util.PhoenixConfigurationUtil;
 import org.apache.phoenix.mapreduce.util.PhoenixMapReduceUtil;
 import org.apache.phoenix.parse.HintNode.Hint;
 import org.apache.phoenix.query.ConnectionQueryServices;
+import org.apache.phoenix.query.QueryServices;
+import org.apache.phoenix.query.QueryServicesOptions;
 import org.apache.phoenix.schema.PIndexState;
 import org.apache.phoenix.schema.PTable;
 import org.apache.phoenix.schema.PTable.IndexType;
@@ -498,6 +500,17 @@ public class IndexTool extends Configured implements Tool {
         private Job configureJobForServerBuildIndex()
                 throws Exception {
 
+            long indexRebuildQueryTimeoutMs =
+                    configuration.getLong(QueryServices.INDEX_REBUILD_QUERY_TIMEOUT_ATTRIB,
+                            QueryServicesOptions.DEFAULT_INDEX_REBUILD_QUERY_TIMEOUT);
+            // Set various phoenix and hbase level timeouts and rpc retries
+            configuration.set(QueryServices.THREAD_TIMEOUT_MS_ATTRIB,
+                    Long.toString(indexRebuildQueryTimeoutMs));
+            configuration.set(HConstants.HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD,
+                    Long.toString(indexRebuildQueryTimeoutMs));
+            configuration.set(HConstants.HBASE_RPC_TIMEOUT_KEY,
+                    Long.toString(indexRebuildQueryTimeoutMs));
+
             PhoenixConfigurationUtil.setIndexToolDataTableName(configuration, qDataTable);
             PhoenixConfigurationUtil.setIndexToolIndexTableName(configuration, qIndexTable);
 
@@ -513,6 +526,7 @@ public class IndexTool extends Configured implements Tool {
                 fs = outputPath.getFileSystem(configuration);
                 fs.delete(outputPath, true);
             }
+            configuration.set("mapreduce.task.timeout", Long.toString(indexRebuildQueryTimeoutMs));
             final String jobName = String.format(INDEX_JOB_NAME_TEMPLATE, schemaName, dataTable, indexTable);
             final Job job = Job.getInstance(configuration, jobName);
             job.setJarByClass(IndexTool.class);
@@ -665,7 +679,9 @@ public class IndexTool extends Configured implements Tool {
                     int autosplitNumRegions = nOpt == null ? DEFAULT_AUTOSPLIT_NUM_REGIONS : Integer.parseInt(nOpt);
                     String rateOpt = cmdLine.getOptionValue(SPLIT_INDEX_OPTION.getOpt());
                     double samplingRate = rateOpt == null ? DEFAULT_SPLIT_SAMPLING_RATE : Double.parseDouble(rateOpt);
-                    LOGGER.info(String.format("Will split index %s , autosplit=%s , autoSplitNumRegions=%s , samplingRate=%s", indexTable, autosplit, autosplitNumRegions, samplingRate));
+                    LOGGER.info(String.format("Will split index %s , autosplit=%s ," +
+                            " autoSplitNumRegions=%s , samplingRate=%s", indexTable,
+                            autosplit, autosplitNumRegions, samplingRate));
                     splitIndexTable(connection.unwrap(PhoenixConnection.class), autosplit, autosplitNumRegions, samplingRate, configuration);
                 }
             }
@@ -686,7 +702,8 @@ public class IndexTool extends Configured implements Tool {
                 job.submit();
                 return 0;
             }
-            LOGGER.info("Running Index Build in Foreground. Waits for the build to complete. This may take a long time!.");
+            LOGGER.info("Running Index Build in Foreground. Waits for the build to complete." +
+                    " This may take a long time!.");
             boolean result = job.waitForCompletion(true);
             
             if (result) {

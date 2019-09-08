@@ -223,7 +223,7 @@ public class Indexer implements RegionObserver, RegionCoprocessor {
         this.lockManager = new LockManager();
 
         // Metrics impl for the Indexer -- avoiding unnecessary indirection for hadoop-1/2 compat
-        this.metricSource = MetricsIndexerSourceFactory.getInstance().create();
+        this.metricSource = MetricsIndexerSourceFactory.getInstance().getIndexerSource();
         setSlowThresholds(e.getConfiguration());
 
         try {
@@ -322,7 +322,8 @@ public class Indexer implements RegionObserver, RegionCoprocessor {
           long duration = EnvironmentEdgeManager.currentTimeMillis() - start;
           if (duration >= slowIndexPrepareThreshold) {
               if (LOGGER.isDebugEnabled()) {
-                  LOGGER.debug(getCallTooSlowMessage("preIncrementAfterRowLock", duration, slowPreIncrementThreshold));
+                  LOGGER.debug(getCallTooSlowMessage("preIncrementAfterRowLock",
+                          duration, slowPreIncrementThreshold));
               }
               metricSource.incrementSlowDuplicateKeyCheckCalls();
           }
@@ -346,7 +347,8 @@ public class Indexer implements RegionObserver, RegionCoprocessor {
           long duration = EnvironmentEdgeManager.currentTimeMillis() - start;
           if (duration >= slowIndexPrepareThreshold) {
               if (LOGGER.isDebugEnabled()) {
-                  LOGGER.debug(getCallTooSlowMessage("preBatchMutate", duration, slowIndexPrepareThreshold));
+                  LOGGER.debug(getCallTooSlowMessage("preBatchMutate",
+                          duration, slowIndexPrepareThreshold));
               }
               metricSource.incrementNumSlowIndexPrepareCalls();
           }
@@ -498,7 +500,8 @@ public class Indexer implements RegionObserver, RegionCoprocessor {
           long duration = EnvironmentEdgeManager.currentTimeMillis() - start;
           if (duration >= slowIndexPrepareThreshold) {
               if (LOGGER.isDebugEnabled()) {
-                  LOGGER.debug(getCallTooSlowMessage("indexPrepare", duration, slowIndexPrepareThreshold));
+                  LOGGER.debug(getCallTooSlowMessage(
+                          "indexPrepare", duration, slowIndexPrepareThreshold));
               }
               metricSource.incrementNumSlowIndexPrepareCalls();
           }
@@ -525,11 +528,13 @@ public class Indexer implements RegionObserver, RegionCoprocessor {
               if (durability != Durability.SKIP_WAL) {
                   // we have all the WAL durability, so we just update the WAL entry and move on
                   for (Pair<Mutation, byte[]> entry : indexUpdates) {
-                    edit.add(new IndexedKeyValue(entry.getSecond(), entry.getFirst()));
+                      edit.add(IndexedKeyValue.newIndexedKeyValue(entry.getSecond(),
+                          entry.getFirst()));
+                      }
                   }              
               }
           }
-      }
+
   }
 
   private void setBatchMutateContext(ObserverContext<RegionCoprocessorEnvironment> c, BatchMutateContext context) {
@@ -569,7 +574,8 @@ public class Indexer implements RegionObserver, RegionCoprocessor {
            long duration = EnvironmentEdgeManager.currentTimeMillis() - start;
            if (duration >= slowIndexWriteThreshold) {
                if (LOGGER.isDebugEnabled()) {
-                   LOGGER.debug(getCallTooSlowMessage("postBatchMutateIndispensably", duration, slowIndexWriteThreshold));
+                   LOGGER.debug(getCallTooSlowMessage("postBatchMutateIndispensably",
+                           duration, slowIndexWriteThreshold));
                }
                metricSource.incrementNumSlowIndexWriteCalls();
            }
@@ -609,27 +615,13 @@ public class Indexer implements RegionObserver, RegionCoprocessor {
           long duration = EnvironmentEdgeManager.currentTimeMillis() - start;
           if (duration >= slowIndexWriteThreshold) {
               if (LOGGER.isDebugEnabled()) {
-                  LOGGER.debug(getCallTooSlowMessage("indexWrite", duration, slowIndexWriteThreshold));
+                  LOGGER.debug(getCallTooSlowMessage("indexWrite",
+                          duration, slowIndexWriteThreshold));
               }
               metricSource.incrementNumSlowIndexWriteCalls();
           }
           metricSource.updateIndexWriteTime(duration);
       }
-  }
-
-  /**
-   * Search the {@link WALEdit} for the first {@link IndexedKeyValue} present
-   * @param edit {@link WALEdit}
-   * @return the first {@link IndexedKeyValue} in the {@link WALEdit} or <tt>null</tt> if not
-   *         present
-   */
-  private IndexedKeyValue getFirstIndexedKeyValue(WALEdit edit) {
-    for (Cell kv : edit.getCells()) {
-      if (kv instanceof IndexedKeyValue) {
-        return (IndexedKeyValue) kv;
-      }
-    }
-    return null;
   }
 
   /**
@@ -717,7 +709,8 @@ public class Indexer implements RegionObserver, RegionCoprocessor {
           long duration = EnvironmentEdgeManager.currentTimeMillis() - start;
           if (duration >= slowPreWALRestoreThreshold) {
               if (LOGGER.isDebugEnabled()) {
-                  LOGGER.debug(getCallTooSlowMessage("preWALRestore", duration, slowPreWALRestoreThreshold));
+                  LOGGER.debug(getCallTooSlowMessage("preWALRestore",
+                          duration, slowPreWALRestoreThreshold));
               }
               metricSource.incrementNumSlowPreWALRestoreCalls();
           }
