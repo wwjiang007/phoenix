@@ -117,6 +117,7 @@ public abstract class MetaDataProtocol extends MetaDataService {
     public static final int CLIENT_KEY_VALUE_BUILDER_THRESHOLD = VersionUtil.encodeVersion("0", "94", "14");
     // Version at which we allow SYSTEM.CATALOG to split
     public static final int MIN_SPLITTABLE_SYSTEM_CATALOG = VersionUtil.encodeVersion("5", "1", "0");
+    public static final String MIN_SPLITTABLE_SYSTEM_CATALOG_VERSION = "5.1.0";
 
     // Version at and after which we will no longer expect client to serialize thresholdBytes for
     // spooling into the scan
@@ -178,6 +179,9 @@ public abstract class MetaDataProtocol extends MetaDataService {
         AUTO_PARTITION_SEQUENCE_NOT_FOUND,
         CANNOT_COERCE_AUTO_PARTITION_ID,
         TOO_MANY_INDEXES,
+        UNABLE_TO_CREATE_CHILD_LINK,
+        UNABLE_TO_UPDATE_PARENT_TABLE,
+        UNABLE_TO_DELETE_CHILD_LINK,
         NO_OP
     };
 

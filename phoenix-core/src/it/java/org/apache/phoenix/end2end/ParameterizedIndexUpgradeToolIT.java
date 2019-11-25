@@ -30,7 +30,10 @@ import org.apache.phoenix.mapreduce.index.IndexUpgradeTool;
 import org.apache.phoenix.query.BaseTest;
 import org.apache.phoenix.query.ConnectionQueryServices;
 import org.apache.phoenix.query.QueryServices;
+import org.apache.phoenix.util.PhoenixRuntime;
+import org.apache.phoenix.util.PropertiesUtil;
 import org.apache.phoenix.util.ReadOnlyProps;
+import org.apache.phoenix.util.SchemaUtil;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -56,6 +59,7 @@ import java.util.UUID;
 
 import static org.apache.phoenix.mapreduce.index.IndexUpgradeTool.ROLLBACK_OP;
 import static org.apache.phoenix.mapreduce.index.IndexUpgradeTool.UPGRADE_OP;
+import static org.apache.phoenix.util.TestUtil.TEST_PROPERTIES;
 
 @RunWith(Parameterized.class)
 @Category(NeedsOwnMiniClusterTest.class)
@@ -65,10 +69,15 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
     private static final String [] INDEXES_LIST_NAMESPACE = {"TEST:INDEX1", "TEST:INDEX2"
             , "TEST1:INDEX3", "TEST1:INDEX2","TEST1:INDEX1"
             , "TEST:INDEX3", "TEST:_IDX_MOCK1", "TEST1:_IDX_MOCK2"};
-    private static final String [] TABLE_LIST = {"TEST.MOCK1","TEST1.MOCK2","TEST.MOCK3"};
-    private static final String [] TABLE_LIST_NAMESPACE = {"TEST:MOCK1","TEST1:MOCK2","TEST:MOCK3"};
+    private static final String [] TRANSACTIONAL_INDEXES_LIST = {"TRANSACTIONAL_INDEX",
+            "_IDX_TRANSACTIONAL_TABLE"};
 
-    private static final String INPUT_LIST = "TEST.MOCK1,TEST1.MOCK2,TEST.MOCK3";
+    private static final String [] TABLE_LIST = {"TEST.MOCK1","TEST1.MOCK2","TEST.MOCK3","TEST.MULTI_TENANT_TABLE"};
+    private static final String [] TABLE_LIST_NAMESPACE = {"TEST:MOCK1","TEST1:MOCK2","TEST:MOCK3",
+            "TEST:MULTI_TENANT_TABLE"};
+
+    private static final String [] TRANSACTIONAL_TABLE_LIST = {"TRANSACTIONAL_TABLE"};
+    private static final String INPUT_LIST = "TEST.MOCK1,TEST1.MOCK2,TEST.MOCK3,TEST.MULTI_TENANT_TABLE";
     private static final String INPUT_FILE = "/tmp/input_file_index_upgrade.csv";
 
     private static Map<String, String> serverProps = Maps.newHashMapWithExpectedSize(1),
@@ -81,6 +90,7 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
     private StringBuilder optionsBuilder;
     private String tableDDLOptions;
     private Connection conn;
+    private Connection connTenant;
     private Admin admin;
     private IndexUpgradeTool iut;
 
@@ -95,6 +105,12 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
 
         conn = DriverManager.getConnection(getUrl(), new Properties());
         conn.setAutoCommit(true);
+
+        String tenantId = generateUniqueName();
+        Properties props = PropertiesUtil.deepCopy(TEST_PROPERTIES);
+        props.setProperty(PhoenixRuntime.TENANT_ID_ATTRIB, tenantId);
+        connTenant = DriverManager.getConnection(getUrl(), props);
+
         ConnectionQueryServices queryServices = conn.unwrap(PhoenixConnection.class)
                 .getQueryServices();
         admin = queryServices.getAdmin();
@@ -136,11 +152,21 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
             conn.createStatement().execute("CREATE SCHEMA TEST1");
         }
         conn.createStatement().execute("CREATE TABLE TEST.MOCK1 (id bigint NOT NULL "
-                + "PRIMARY KEY, a.name varchar, sal bigint, address varchar)"+tableDDLOptions);
+                + "PRIMARY KEY, a.name varchar, sal bigint, address varchar)" + tableDDLOptions);
         conn.createStatement().execute("CREATE TABLE TEST1.MOCK2 (id bigint NOT NULL "
-                + "PRIMARY KEY, name varchar, city varchar, phone bigint)"+tableDDLOptions);
+                + "PRIMARY KEY, name varchar, city varchar, phone bigint)" + tableDDLOptions);
         conn.createStatement().execute("CREATE TABLE TEST.MOCK3 (id bigint NOT NULL "
-                + "PRIMARY KEY, name varchar, age bigint)"+tableDDLOptions);
+                + "PRIMARY KEY, name varchar, age bigint)" + tableDDLOptions);
+        String
+                createTblStr =
+                "CREATE TABLE TEST.MULTI_TENANT_TABLE " + " (TENANT_ID VARCHAR(15) NOT NULL,ID INTEGER NOT NULL"
+                        + ", NAME VARCHAR, CONSTRAINT PK_1 PRIMARY KEY (TENANT_ID, ID)) MULTI_TENANT=true";
+        conn.createStatement().execute(createTblStr);
+        String createTxnTableStr = "CREATE TABLE TRANSACTIONAL_TABLE(id bigint NOT NULL "
+                + "PRIMARY KEY, a.name varchar, sal bigint, address varchar) "
+                + " TRANSACTIONAL=true , TRANSACTION_PROVIDER='TEPHRA' "
+                + ((tableDDLOptions.trim().length() > 0) ? "," : "") + tableDDLOptions;
+        conn.createStatement().execute(createTxnTableStr);
 
         //views
         conn.createStatement().execute("CREATE VIEW TEST.MOCK1_VIEW (view_column varchar) "
@@ -149,15 +175,15 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
                 + " zip varchar) AS SELECT * FROM TEST.MOCK1 WHERE a.name = 'a'");
         conn.createStatement().execute("CREATE VIEW TEST1.MOCK2_VIEW (view_column varchar,"
                 + " state varchar) AS SELECT * FROM TEST1.MOCK2 WHERE name = 'c'");
+        conn.createStatement().execute("CREATE VIEW TRANSACTIONAL_VIEW (view_column varchar,"
+                + " state varchar) AS SELECT * FROM TRANSACTIONAL_TABLE WHERE name = 'c'");
+
         //view-indexes
-        conn.createStatement().execute("CREATE INDEX MOCK1_INDEX1 ON TEST.MOCK1_VIEW1 "
-                + "(view_column)");
-        conn.createStatement().execute("CREATE INDEX MOCK1_INDEX2 ON TEST.MOCK1_VIEW1 "
-                + "(zip)");
-        conn.createStatement().execute("CREATE INDEX MOCK2_INDEX1 ON TEST1.MOCK2_VIEW "
-                + "(state, city)");
-        conn.createStatement().execute("CREATE INDEX MOCK1_INDEX3 ON TEST.MOCK1_VIEW "
-                + "(view_column)");
+        conn.createStatement().execute("CREATE INDEX MOCK1_INDEX1 ON TEST.MOCK1_VIEW1 " + "(view_column)");
+        conn.createStatement().execute("CREATE INDEX MOCK1_INDEX2 ON TEST.MOCK1_VIEW1 " + "(zip)");
+        conn.createStatement().execute("CREATE INDEX MOCK2_INDEX1 ON TEST1.MOCK2_VIEW " + "(state, city)");
+        conn.createStatement().execute("CREATE INDEX MOCK1_INDEX3 ON TEST.MOCK1_VIEW " + "(view_column)");
+        conn.createStatement().execute("CREATE INDEX TRANSACTIONAL_VIEW_INDEX ON TRANSACTIONAL_VIEW " + "(view_column)");
         //indexes
         conn.createStatement().execute("CREATE INDEX INDEX1 ON TEST.MOCK1 (sal, a.name)");
         conn.createStatement().execute("CREATE INDEX INDEX2 ON TEST.MOCK1 (a.name)");
@@ -165,6 +191,16 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
         conn.createStatement().execute("CREATE INDEX INDEX2 ON TEST1.MOCK2 (phone)");
         conn.createStatement().execute("CREATE INDEX INDEX3 ON TEST1.MOCK2 (name)");
         conn.createStatement().execute("CREATE INDEX INDEX3 ON TEST.MOCK3 (age, name)");
+        conn.createStatement().execute("CREATE INDEX TRANSACTIONAL_INDEX ON TRANSACTIONAL_TABLE(sal)");
+
+        // Tenant ones
+        connTenant.createStatement().execute(
+                "CREATE VIEW TEST.TEST_TENANT_VIEW AS SELECT * FROM TEST.MULTI_TENANT_TABLE");
+        connTenant.createStatement().execute("CREATE INDEX MULTI_TENANT_INDEX ON TEST.TEST_TENANT_VIEW (NAME)");
+
+        conn.createStatement().execute("ALTER INDEX MOCK1_INDEX2 ON TEST.MOCK1_VIEW1 DISABLE");
+        connTenant.createStatement().execute("ALTER INDEX MULTI_TENANT_INDEX ON TEST.TEST_TENANT_VIEW DISABLE");
+        conn.createStatement().execute("ALTER INDEX INDEX2 ON TEST.MOCK1 DISABLE");
     }
 
     private void validate(boolean pre) throws IOException {
@@ -203,6 +239,15 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
             Assert.assertTrue(admin.getDescriptor(TableName.valueOf(index))
                     .hasCoprocessor(GlobalIndexChecker.class.getName()));
         }
+        // Transactional indexes should not have new coprocessors
+        for (String index : TRANSACTIONAL_INDEXES_LIST) {
+            Assert.assertFalse(admin.getDescriptor(TableName.valueOf(index))
+                    .hasCoprocessor(GlobalIndexChecker.class.getName()));
+        }
+        for (String table : TRANSACTIONAL_TABLE_LIST) {
+            Assert.assertFalse(admin.getDescriptor(TableName.valueOf(table))
+                    .hasCoprocessor(IndexRegionObserver.class.getName()));
+        }
     }
 
     private void checkOldIndexingCoprocessors(String [] indexList, String [] tableList)
@@ -222,21 +267,16 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
     }
 
     @Parameters(name ="IndexUpgradeToolIT_mutable={0},upgrade={1},isNamespaceEnabled={2}")
-    public static Collection<Object[]> data() {
+    public static synchronized Collection<Object[]> data() {
         return Arrays.asList(new Object[][] {
             {false, false, true},
-            {true, false, true},
-            {false, true, true},
-            {true, true, true},
-            {false, false, false},
             {true, false, false},
             {false, true, false},
-            {true, true, false}
+            {true, true, true}
         });
     }
 
-    public ParameterizedIndexUpgradeToolIT(boolean mutable, boolean upgrade,
-            boolean isNamespaceEnabled) {
+    public ParameterizedIndexUpgradeToolIT(boolean mutable, boolean upgrade, boolean isNamespaceEnabled) {
         this.mutable = mutable;
         this.upgrade = upgrade;
         this.isNamespaceEnabled = isNamespaceEnabled;
@@ -265,6 +305,20 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
     }
 
     @Test
+    public void testToolWithNoIndex() throws Exception {
+        if (!upgrade || isNamespaceEnabled) {
+            return;
+        }
+        conn.createStatement().execute("CREATE TABLE TEST.NEW_TABLE (id bigint NOT NULL "
+                + "PRIMARY KEY, a.name varchar, sal bigint, address varchar)" + tableDDLOptions);
+        iut.setInputTables("TEST.NEW_TABLE");
+        iut.prepareToolSetup();
+        int status = iut.executeTool();
+        Assert.assertEquals(0, status);
+        conn.createStatement().execute("DROP TABLE TEST.NEW_TABLE");
+    }
+
+    @Test
     public void testToolWithInputFileParameter() throws Exception {
         BufferedWriter writer = new BufferedWriter(new FileWriter(new File(INPUT_FILE)));
         writer.write(INPUT_LIST);
@@ -289,24 +343,33 @@ public class ParameterizedIndexUpgradeToolIT extends BaseTest {
         conn.createStatement().execute("DROP INDEX INDEX2 ON TEST1.MOCK2");
         conn.createStatement().execute("DROP INDEX INDEX3 ON TEST1.MOCK2");
         conn.createStatement().execute("DROP INDEX INDEX3 ON TEST.MOCK3");
+        connTenant.createStatement().execute("DROP INDEX MULTI_TENANT_INDEX ON TEST.TEST_TENANT_VIEW");
+        conn.createStatement().execute("DROP INDEX TRANSACTIONAL_INDEX ON TRANSACTIONAL_TABLE");
 
         conn.createStatement().execute("DROP INDEX MOCK1_INDEX3 ON TEST.MOCK1_VIEW");
         conn.createStatement().execute("DROP INDEX MOCK1_INDEX1 ON TEST.MOCK1_VIEW1");
         conn.createStatement().execute("DROP INDEX MOCK1_INDEX2 ON TEST.MOCK1_VIEW1");
         conn.createStatement().execute("DROP INDEX MOCK2_INDEX1 ON TEST1.MOCK2_VIEW");
+        conn.createStatement().execute("DROP INDEX TRANSACTIONAL_VIEW_INDEX ON TRANSACTIONAL_VIEW");
 
         conn.createStatement().execute("DROP VIEW TEST.MOCK1_VIEW");
         conn.createStatement().execute("DROP VIEW TEST.MOCK1_VIEW1");
         conn.createStatement().execute("DROP VIEW TEST1.MOCK2_VIEW");
+        conn.createStatement().execute("DROP VIEW TRANSACTIONAL_VIEW");
+        connTenant.createStatement().execute("DROP VIEW TEST.TEST_TENANT_VIEW");
 
         conn.createStatement().execute("DROP TABLE TEST.MOCK1");
         conn.createStatement().execute("DROP TABLE TEST1.MOCK2");
         conn.createStatement().execute("DROP TABLE TEST.MOCK3");
+        conn.createStatement().execute("DROP TABLE TEST.MULTI_TENANT_TABLE");
+
+        conn.createStatement().execute("DROP TABLE TRANSACTIONAL_TABLE");
 
         if (isNamespaceEnabled) {
             conn.createStatement().execute("DROP SCHEMA TEST");
             conn.createStatement().execute("DROP SCHEMA TEST1");
         }
         conn.close();
+        connTenant.close();
     }
 }

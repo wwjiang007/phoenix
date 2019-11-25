@@ -300,19 +300,20 @@ public class IndexTool extends Configured implements Tool {
             } else {
                 long maxTimeRange = pIndexTable.getTimeStamp() + 1;
                 // this is set to ensure index tables remains consistent post population.
-
                 if (pDataTable.isTransactional()) {
                     configuration.set(PhoenixConfigurationUtil.TX_SCN_VALUE,
                             Long.toString(TransactionUtil.convertToNanoseconds(maxTimeRange)));
                     configuration.set(PhoenixConfigurationUtil.TX_PROVIDER, pDataTable.getTransactionProvider().name());
                 }
-                configuration.set(PhoenixConfigurationUtil.CURRENT_SCN_VALUE,
-                        Long.toString(maxTimeRange));
                 if (useSnapshot || !useDirectApi || (!isLocalIndexBuild && pDataTable.isTransactional())) {
+                    configuration.set(PhoenixConfigurationUtil.CURRENT_SCN_VALUE,
+                            Long.toString(maxTimeRange));
                     return configureJobForAysncIndex();
-                }
-                else {
-                    //Local and non-transactional global indexes to be built on the server side
+                } else {
+                    // Local and non-transactional global indexes to be built on the server side
+                    // It is safe not to set CURRENT_SCN_VALUE for server side rebuilds, in order to make sure that
+                    // all the rows that exist so far will be rebuilt. The current time of the servers will
+                    // be used to set the time range for server side scans.
                     return configureJobForServerBuildIndex();
                 }
             }
@@ -499,17 +500,28 @@ public class IndexTool extends Configured implements Tool {
 
         private Job configureJobForServerBuildIndex()
                 throws Exception {
-
             long indexRebuildQueryTimeoutMs =
                     configuration.getLong(QueryServices.INDEX_REBUILD_QUERY_TIMEOUT_ATTRIB,
                             QueryServicesOptions.DEFAULT_INDEX_REBUILD_QUERY_TIMEOUT);
+            long indexRebuildRPCTimeoutMs =
+                    configuration.getLong(QueryServices.INDEX_REBUILD_RPC_TIMEOUT_ATTRIB,
+                            QueryServicesOptions.DEFAULT_INDEX_REBUILD_RPC_TIMEOUT);
+            long indexRebuildClientScannerTimeOutMs =
+                    configuration.getLong(QueryServices.INDEX_REBUILD_CLIENT_SCANNER_TIMEOUT_ATTRIB,
+                            QueryServicesOptions.DEFAULT_INDEX_REBUILD_CLIENT_SCANNER_TIMEOUT);
+            int indexRebuildRpcRetriesCounter =
+                    configuration.getInt(QueryServices.INDEX_REBUILD_RPC_RETRIES_COUNTER,
+                            QueryServicesOptions.DEFAULT_INDEX_REBUILD_RPC_RETRIES_COUNTER);
             // Set various phoenix and hbase level timeouts and rpc retries
             configuration.set(QueryServices.THREAD_TIMEOUT_MS_ATTRIB,
                     Long.toString(indexRebuildQueryTimeoutMs));
             configuration.set(HConstants.HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD,
-                    Long.toString(indexRebuildQueryTimeoutMs));
+                    Long.toString(indexRebuildClientScannerTimeOutMs));
             configuration.set(HConstants.HBASE_RPC_TIMEOUT_KEY,
-                    Long.toString(indexRebuildQueryTimeoutMs));
+                    Long.toString(indexRebuildRPCTimeoutMs));
+            configuration.set(HConstants.HBASE_CLIENT_RETRIES_NUMBER,
+                    Long.toString(indexRebuildRpcRetriesCounter));
+            configuration.set("mapreduce.task.timeout", Long.toString(indexRebuildQueryTimeoutMs));
 
             PhoenixConfigurationUtil.setIndexToolDataTableName(configuration, qDataTable);
             PhoenixConfigurationUtil.setIndexToolIndexTableName(configuration, qIndexTable);
@@ -526,7 +538,6 @@ public class IndexTool extends Configured implements Tool {
                 fs = outputPath.getFileSystem(configuration);
                 fs.delete(outputPath, true);
             }
-            configuration.set("mapreduce.task.timeout", Long.toString(indexRebuildQueryTimeoutMs));
             final String jobName = String.format(INDEX_JOB_NAME_TEMPLATE, schemaName, dataTable, indexTable);
             final Job job = Job.getInstance(configuration, jobName);
             job.setJarByClass(IndexTool.class);
@@ -535,7 +546,7 @@ public class IndexTool extends Configured implements Tool {
                 FileOutputFormat.setOutputPath(job, outputPath);
             }
 
-            PhoenixMapReduceUtil.setInput(job, PhoenixIndexDBWritable.class, PhoenixServerBuildIndexInputFormat.class,
+            PhoenixMapReduceUtil.setInput(job, PhoenixServerBuildIndexDBWritable.class, PhoenixServerBuildIndexInputFormat.class,
                             qDataTable, "");
 
             TableMapReduceUtil.initCredentials(job);

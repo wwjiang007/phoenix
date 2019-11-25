@@ -18,6 +18,8 @@
 package org.apache.phoenix.coprocessor;
 
 import static org.apache.hadoop.hbase.KeyValueUtil.createFirstOnRow;
+import static org.apache.phoenix.coprocessor.MetaDataProtocol.MIN_SPLITTABLE_SYSTEM_CATALOG;
+import static org.apache.phoenix.coprocessor.generated.MetaDataProtos.MutationCode.UNABLE_TO_CREATE_CHILD_LINK;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.APPEND_ONLY_SCHEMA_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.ARRAY_SIZE_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.AUTO_PARTITION_SEQ_BYTES;
@@ -57,6 +59,7 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SALT_BUCKETS_BYTES
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SORT_ORDER_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.STORAGE_SCHEME_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.STORE_NULLS_BYTES;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_SEQ_NUM_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_TYPE_BYTES;
@@ -74,6 +77,7 @@ import static org.apache.phoenix.query.QueryConstants.VIEW_MODIFIED_PROPERTY_TAG
 import static org.apache.phoenix.schema.PTableType.INDEX;
 import static org.apache.phoenix.util.SchemaUtil.getVarCharLength;
 import static org.apache.phoenix.util.SchemaUtil.getVarChars;
+import static org.apache.phoenix.util.ViewUtil.getSystemTableForChildLinks;
 
 import java.io.IOException;
 import java.security.PrivilegedExceptionAction;
@@ -1718,10 +1722,14 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                 }
             }
 
-            // check if the table was dropped, but had child views that were have not yet been cleaned up
-            if (!Bytes.toString(schemaName).equals(QueryConstants.SYSTEM_SCHEMA_NAME) &&
-                    clientVersion >= MIN_SPLITTABLE_SYSTEM_CATALOG) {
-                ViewUtil.dropChildViews(env, tenantIdBytes, schemaName, tableName);
+            // check if the table was previously dropped, but had child views that have not
+            // yet been cleaned up.
+            // Note that for old clients connecting to a 4.15 server whose metadata hasn't been
+            // upgraded, we disallow dropping a base table that has child views, so in that case
+            // this is a no-op (See PHOENIX-5544)
+            if (!Bytes.toString(schemaName).equals(QueryConstants.SYSTEM_SCHEMA_NAME)) {
+                ViewUtil.dropChildViews(env, tenantIdBytes, schemaName, tableName,
+                        getSystemTableForChildLinks(clientVersion, env.getConfiguration()).getName());
             }
 
             byte[] parentTableKey = null;
@@ -1735,6 +1743,45 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                 byte[][] parentPhysicalSchemaTableNames = new byte[3][];
                 getParentAndPhysicalNames(tableMetadata, parentSchemaTableNames, parentPhysicalSchemaTableNames);
                 if (parentPhysicalSchemaTableNames[2] != null) {
+                    if (parentTable == null) {
+                        // This is needed when we connect with a 4.14 client to
+                        // a 4.15.0+ server.
+                        // In that case we need to resolve the parent table on
+                        // the server.
+                        parentTable = doGetTable(ByteUtil.EMPTY_BYTE_ARRAY,
+                                parentPhysicalSchemaTableNames[1],
+                                parentPhysicalSchemaTableNames[2], clientTimeStamp, clientVersion);
+                        if (parentTable == null) {
+                            builder.setReturnCode(
+                                    MetaDataProtos.MutationCode.PARENT_TABLE_NOT_FOUND);
+                            builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
+                            done.run(builder.build());
+                            return;
+                        }
+                        if (parentSchemaTableNames[2] != null
+                                && Bytes.compareTo(parentSchemaTableNames[2],
+                                        parentPhysicalSchemaTableNames[2]) != 0) {
+                            // if view is created on view
+                            byte[] tenantId = parentSchemaTableNames[0] == null
+                                    ? ByteUtil.EMPTY_BYTE_ARRAY
+                                    : parentSchemaTableNames[0];
+                            parentTable = doGetTable(tenantId, parentSchemaTableNames[1],
+                                    parentSchemaTableNames[2], clientTimeStamp, clientVersion);
+                            if (parentTable == null) {
+                                // it could be a global view
+                                parentTable = doGetTable(ByteUtil.EMPTY_BYTE_ARRAY,
+                                        parentSchemaTableNames[1], parentSchemaTableNames[2],
+                                        clientTimeStamp, clientVersion);
+                            }
+                        }
+                        if (parentTable == null) {
+                            builder.setReturnCode(
+                                    MetaDataProtos.MutationCode.PARENT_TABLE_NOT_FOUND);
+                            builder.setMutationTime(EnvironmentEdgeManager.currentTimeMillis());
+                            done.run(builder.build());
+                            return;
+                        }
+                    }
                     parentTableKey = SchemaUtil.getTableKey(ByteUtil.EMPTY_BYTE_ARRAY,
                             parentPhysicalSchemaTableNames[1], parentPhysicalSchemaTableNames[2]);
                     cParentPhysicalName = parentTable.getPhysicalName().getBytes();
@@ -1757,6 +1804,13 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                  */
                 parentTableName = MetaDataUtil.getParentTableName(tableMetadata);
                 parentTableKey = SchemaUtil.getTableKey(tenantIdBytes, parentSchemaName, parentTableName);
+                if (parentTable == null) {
+                    // This is needed when we connect with a 4.14 client to a 4.15.0+ server.
+                    // In that case we need to resolve the parent table on the server.
+                    parentTable =
+                            doGetTable(tenantIdBytes, parentSchemaName, parentTableName, clientTimeStamp, null,
+                                    request.getClientVersion());
+                }
                 if (IndexType.LOCAL == indexType) {
                     cPhysicalName = parentTable.getPhysicalName().getBytes();
                     cParentPhysicalName = parentTable.getPhysicalName().getBytes();
@@ -1908,11 +1962,11 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                         PName physicalName = parentTable.getPhysicalName();
                         long seqValue = getViewIndexSequenceValue(connection, tenantIdStr, parentTable, physicalName);
                         Put tableHeaderPut = MetaDataUtil.getPutOnlyTableHeaderRow(tableMetadata);
-
                         NavigableMap<byte[], List<Cell>> familyCellMap = tableHeaderPut.getFamilyCellMap();
                         List<Cell> cells = familyCellMap.get(TABLE_FAMILY_BYTES);
                         Cell cell = cells.get(0);
-                        PDataType dataType = MetaDataUtil.getViewIndexIdDataType();
+                        PDataType<?> dataType = MetaDataUtil.getIndexDataType(tableMetadata,
+                                GenericKeyValueBuilder.INSTANCE, new ImmutableBytesWritable());
                         Object val = dataType.toObject(seqValue, PLong.INSTANCE);
                         byte[] bytes = new byte[dataType.getByteSize() + 1];
                         dataType.toBytes(val, bytes, 0);
@@ -1931,24 +1985,34 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                 // The mutations to create a table are written in the following order:
                 // 1. Write the child link as if the next two steps fail we
                 // ignore missing children while processing a parent
+                // (this is already done at this point, as a separate client-server RPC
+                // to the ChildLinkMetaDataEndpoint coprocessor)
                 // 2. Update the encoded column qualifier for the parent table if its on a
                 // different region server (for tables that use column qualifier encoding)
                 // if the next step fails we end up wasting a few col qualifiers
                 // 3. Finally write the mutations to create the table
 
-                // From 4.15 the parent->child links are stored in a separate table SYSTEM.CHILD_LINK
-                // TODO remove this after PHOENIX-4810 is implemented
-                List<Mutation> childLinkMutations = MetaDataUtil.removeChildLinks(tableMetadata);
-                MetaDataResponse response =
-                        processRemoteRegionMutations(
-                                PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES,
-                                childLinkMutations, MetaDataProtos.MutationCode.UNABLE_TO_CREATE_CHILD_LINK);
-                if (response != null) {
-                    done.run(response);
-                    return;
-                }
-
                 if (tableType == PTableType.VIEW) {
+                    // If we are connecting with an old client to a server that has new metadata
+                    // i.e. it was previously connected to by a 4.15 client, then the client will
+                    // also send the parent->child link metadata to SYSTEM.CATALOG rather than using
+                    // the new ChildLinkMetaDataEndpoint coprocessor. In this case, we must continue
+                    // doing the server-server RPC to send these mutations to SYSTEM.CHILD_LINK.
+                    if (clientVersion < MIN_SPLITTABLE_SYSTEM_CATALOG &&
+                            getSystemTableForChildLinks(clientVersion, env.getConfiguration()).equals(
+                                    SchemaUtil.getPhysicalTableName(SYSTEM_CHILD_LINK_NAME_BYTES,
+                                            env.getConfiguration()))) {
+                        List<Mutation> childLinkMutations =
+                                MetaDataUtil.removeChildLinkMutations(tableMetadata);
+                        MetaDataResponse response =
+                                processRemoteRegionMutations(
+                                        PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES,
+                                        childLinkMutations, UNABLE_TO_CREATE_CHILD_LINK);
+                        if (response != null) {
+                            done.run(response);
+                            return;
+                        }
+                    }
                     // Pass in the parent's PTable so that we only tag cells corresponding to the
                     // view's property in case they are different from the parent
                     ViewUtil.addTagsToPutsForViewAlteredProperties(tableMetadata, parentTable,
@@ -1967,7 +2031,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                     // column qualifier counter on the parent table)
                     if (parentTable != null && tableType == PTableType.VIEW && parentTable
                             .getEncodingScheme() != QualifierEncodingScheme.NON_ENCODED_QUALIFIERS) {
-                        response =
+                        // TODO: Avoid doing server-server RPC when we have held row locks
+                        MetaDataResponse response =
                                 processRemoteRegionMutations(
                                         PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME_BYTES,
                                         remoteMutations, MetaDataProtos.MutationCode.UNABLE_TO_UPDATE_PARENT_TABLE);
@@ -1997,7 +2062,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                 // primary and then index table locks are held, in that order). For now, we just don't support
                 // indexing on the system table. This is an issue because of the way we manage batch mutation
                 // in the Indexer.
-                mutateRowsWithLocks(region, localMutations, Collections.<byte[]>emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
+                mutateRowsWithLocks(this.accessCheckEnabled, region, localMutations, Collections.<byte[]>emptySet(),
+                    HConstants.NO_NONCE, HConstants.NO_NONCE);
 
                 // Invalidate the cache - the next getTable call will add it
                 // TODO: consider loading the table that was just created here, patching up the parent table, and updating the cache
@@ -2037,7 +2103,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         long sequenceTimestamp = HConstants.LATEST_TIMESTAMP;
         try {
             connection.getQueryServices().createSequence(key.getTenantId(), key.getSchemaName(), key.getSequenceName(),
-                    Long.MIN_VALUE, 1, 1, Long.MIN_VALUE, Long.MAX_VALUE, false, sequenceTimestamp);
+                    Short.MIN_VALUE, 1, 1, Long.MIN_VALUE, Long.MAX_VALUE, false, sequenceTimestamp);
         } catch (SequenceAlreadyExistsException e) {
             //someone else got here first and created the sequence, or it was pre-existing. Not a problem.
         }
@@ -2061,8 +2127,7 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
         TableViewFinderResult result = new TableViewFinderResult();
         try (Table hTable =
                      ServerUtil.getHTableForCoprocessorScan(env,
-                             SchemaUtil.getPhysicalTableName(
-                                     PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES,
+                             SchemaUtil.getPhysicalTableName(SYSTEM_CHILD_LINK_NAME_BYTES,
                                      env.getConfiguration()))) {
             ViewUtil.findAllRelatives(hTable, tenantId, schemaName, tableName,
                     LinkType.CHILD_TABLE, result);
@@ -2205,8 +2270,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                 }
 
                 // drop rows from catalog on this region
-                mutateRowsWithLocks(region, localMutations, Collections.<byte[]>emptySet(), HConstants.NO_NONCE,
-                        HConstants.NO_NONCE);
+                mutateRowsWithLocks(this.accessCheckEnabled, region, localMutations, Collections.<byte[]>emptySet(),
+                    HConstants.NO_NONCE, HConstants.NO_NONCE);
 
                 long currentTime = MetaDataUtil.getClientTimeStamp(tableMetadata);
                 for (ImmutableBytesPtr ckey : invalidateList) {
@@ -2217,18 +2282,17 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                     metaDataCache.invalidate(parentCacheKey);
                 }
 
-                // after the view metadata is dropped drop parent->child link
-                MetaDataResponse response =
-                        processRemoteRegionMutations(
-                                PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES,
-                                childLinkMutations, MetaDataProtos.MutationCode.UNABLE_TO_CREATE_CHILD_LINK);
+                // after the view metadata is dropped, drop parent->child link
+                MetaDataResponse response = processRemoteRegionMutations(
+                        getSystemTableForChildLinks(request.getClientVersion(),
+                                env.getConfiguration()).getName(), childLinkMutations,
+                        MetaDataProtos.MutationCode.UNABLE_TO_DELETE_CHILD_LINK);
                 if (response != null) {
                     done.run(response);
                     return;
                 }
 
                 done.run(MetaDataMutationResult.toProto(result));
-                return;
             } finally {
                 ServerUtil.releaseRowLocks(locks);
             }
@@ -2320,25 +2384,47 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
             if (tableType == PTableType.TABLE || tableType == PTableType.VIEW || tableType == PTableType.SYSTEM) {
                 // check to see if the table has any child views
                 try (Table hTable =
-                        ServerUtil.getHTableForCoprocessorScan(env,
-                            SchemaUtil.getPhysicalTableName(
-                                PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES,
-                                env.getConfiguration()))) {
+                        ServerUtil.getHTableForCoprocessorScan(env, getSystemTableForChildLinks(
+                                clientVersion, env.getConfiguration()))) {
                     boolean hasChildViews =
                             ViewUtil.hasChildViews(hTable, tenantId, schemaName, tableName,
                                     clientTimeStamp);
                     if (hasChildViews) {
                         if (!isCascade) {
+                            LOGGER.error("DROP without CASCADE on tables with child views "
+                                    + "is not permitted");
                             // DROP without CASCADE on tables with child views is not permitted
                             return new MetaDataMutationResult(MutationCode.UNALLOWED_TABLE_MUTATION,
                                     EnvironmentEdgeManager.currentTimeMillis(), null);
                         }
-                        try {
-                            PhoenixConnection conn = QueryUtil.getConnectionOnServer(env.getConfiguration()).unwrap(PhoenixConnection.class);
-                            Task.addTask(conn, PTable.TaskType.DROP_CHILD_VIEWS, Bytes.toString(tenantId),
-                                    Bytes.toString(schemaName), Bytes.toString(tableName), this.accessCheckEnabled);
-                        } catch (Throwable t) {
-                            LOGGER.error("Adding a task to drop child views failed!", t);
+                        // For 4.15+ clients and older clients connecting to an upgraded server,
+                        // add a task to drop child views of the base table.
+                        if (clientVersion >= MIN_SPLITTABLE_SYSTEM_CATALOG ||
+                                SchemaUtil.getPhysicalTableName(SYSTEM_CHILD_LINK_NAME_BYTES,
+                                env.getConfiguration()).equals(hTable.getName())) {
+                            try {
+                                PhoenixConnection conn =
+                                        QueryUtil.getConnectionOnServer(env.getConfiguration())
+                                                .unwrap(PhoenixConnection.class);
+                                Task.addTask(conn, PTable.TaskType.DROP_CHILD_VIEWS,
+                                        Bytes.toString(tenantId), Bytes.toString(schemaName),
+                                        Bytes.toString(tableName),
+                                        PTable.TaskStatus.CREATED.toString(),
+                                        null, null, null, null,
+                                        this.accessCheckEnabled);
+                            } catch (Throwable t) {
+                                LOGGER.error("Adding a task to drop child views failed!", t);
+                            }
+                        } else {
+                            // (See PHOENIX-5544) For an old client connecting to a non-upgraded
+                            // server, we disallow dropping a base table that has child views.
+                            LOGGER.error("Dropping a table that has child views is not permitted "
+                                    + "for old clients connecting to a new server with old metadata."
+                                    + " Please upgrade the client to " +
+                                    MIN_SPLITTABLE_SYSTEM_CATALOG_VERSION);
+                            return new MetaDataMutationResult(
+                                    MutationCode.UNALLOWED_TABLE_MUTATION,
+                                    EnvironmentEdgeManager.currentTimeMillis(), null);
                         }
                     }
                 }
@@ -2363,7 +2449,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                     if (rowKeyMetaData[PhoenixDatabaseMetaData.COLUMN_NAME_INDEX].length == 0 && linkType == LinkType.INDEX_TABLE) {
                         indexNames.add(rowKeyMetaData[PhoenixDatabaseMetaData.FAMILY_NAME_INDEX]);
                     } else if (tableType == PTableType.VIEW && (linkType == LinkType.PARENT_TABLE || linkType == LinkType.PHYSICAL_TABLE)) {
-                        // delete parent->child link for views
+                        // Populate the delete mutations for parent->child link for the child view in question,
+                        // which we issue to SYSTEM.CHILD_LINK later
                         Cell parentTenantIdCell = MetaDataUtil.getCell(results, PhoenixDatabaseMetaData.PARENT_TENANT_ID_BYTES);
                         PName parentTenantId = parentTenantIdCell != null ? PNameFactory.newName(parentTenantIdCell.getValueArray(), parentTenantIdCell.getValueOffset(), parentTenantIdCell.getValueLength()) : null;
                         byte[] linkKey = MetaDataUtil.getChildLinkKey(parentTenantId, table.getParentSchemaName(), table.getParentTableName(), table.getTenantId(), table.getName());
@@ -2438,9 +2525,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                         // Also if QueryServices.ALLOW_SPLITTABLE_SYSTEM_CATALOG_ROLLBACK is true, we block adding
                         // a column to a parent table so that we can rollback the upgrade if required.
                         if (clientVersion < MIN_SPLITTABLE_SYSTEM_CATALOG) {
-                            LOGGER.error(
-                                    "Unable to add or drop a column as the client is older than "
-                                            + MIN_SPLITTABLE_SYSTEM_CATALOG);
+                            LOGGER.error("Unable to add or drop a column as the client is older "
+                                    + "than " + MIN_SPLITTABLE_SYSTEM_CATALOG_VERSION);
                             return new MetaDataProtocol.MetaDataMutationResult(MetaDataProtocol.MutationCode.UNALLOWED_TABLE_MUTATION,
                                     EnvironmentEdgeManager.currentTimeMillis(), null);
                         } else if (allowSplittableSystemCatalogRollback) {
@@ -2621,7 +2707,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                         throw new IllegalStateException(msg);
                     }
                 }
-                mutateRowsWithLocks(region, localMutations, Collections.<byte[]>emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
+                mutateRowsWithLocks(this.accessCheckEnabled, region, localMutations, Collections.<byte[]>emptySet(),
+                    HConstants.NO_NONCE, HConstants.NO_NONCE);
                 // Invalidate from cache
                 for (ImmutableBytesPtr invalidateKey : invalidateList) {
                     metaDataCache.invalidate(invalidateKey);
@@ -3299,8 +3386,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                     if (setRowKeyOrderOptimizableCell) {
                         UpgradeUtil.addRowKeyOrderOptimizableCell(tableMetadata, key, timeStamp);
                     }
-                    mutateRowsWithLocks(region, tableMetadata, Collections.<byte[]>emptySet(), HConstants.NO_NONCE,
-                            HConstants.NO_NONCE);
+                    mutateRowsWithLocks(this.accessCheckEnabled, region, tableMetadata, Collections.<byte[]>emptySet(),
+                        HConstants.NO_NONCE, HConstants.NO_NONCE);
                     // Invalidate from cache
                     Cache<ImmutableBytesPtr, PMetaDataEntity> metaDataCache =
                             GlobalCache.getInstance(this.env).getMetaDataCache();
@@ -3550,7 +3637,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                 }
                 // Don't store function info for temporary functions.
                 if (!temporaryFunction) {
-                    mutateRowsWithLocks(region, functionMetaData, Collections.<byte[]>emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
+                    mutateRowsWithLocks(this.accessCheckEnabled, region, functionMetaData,
+                        Collections.<byte[]>emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
                 }
 
                 // Invalidate the cache - the next getFunction call will add it
@@ -3603,7 +3691,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                     done.run(MetaDataMutationResult.toProto(result));
                     return;
                 }
-                mutateRowsWithLocks(region, functionMetaData, Collections.<byte[]>emptySet(), HConstants.NO_NONCE, HConstants.NO_NONCE);
+                mutateRowsWithLocks(this.accessCheckEnabled, region, functionMetaData, Collections.<byte[]>emptySet(),
+                    HConstants.NO_NONCE, HConstants.NO_NONCE);
 
                 Cache<ImmutableBytesPtr, PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env).getMetaDataCache();
                 long currentTime = MetaDataUtil.getClientTimeStamp(functionMetaData);
@@ -3713,8 +3802,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                         return;
                     }
                 }
-                mutateRowsWithLocks(region, schemaMutations, Collections.<byte[]>emptySet(), HConstants.NO_NONCE,
-                        HConstants.NO_NONCE);
+                mutateRowsWithLocks(this.accessCheckEnabled, region, schemaMutations, Collections.<byte[]>emptySet(),
+                    HConstants.NO_NONCE, HConstants.NO_NONCE);
 
                 // Invalidate the cache - the next getSchema call will add it
                 Cache<ImmutableBytesPtr, PMetaDataEntity> metaDataCache =
@@ -3763,8 +3852,8 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
                     done.run(MetaDataMutationResult.toProto(result));
                     return;
                 }
-                mutateRowsWithLocks(region, schemaMetaData, Collections.<byte[]>emptySet(), HConstants.NO_NONCE,
-                        HConstants.NO_NONCE);
+                mutateRowsWithLocks(this.accessCheckEnabled, region, schemaMetaData, Collections.<byte[]>emptySet(),
+                    HConstants.NO_NONCE, HConstants.NO_NONCE);
                 Cache<ImmutableBytesPtr, PMetaDataEntity> metaDataCache = GlobalCache.getInstance(this.env)
                         .getMetaDataCache();
                 long currentTime = MetaDataUtil.getClientTimeStamp(schemaMetaData);
@@ -3826,10 +3915,23 @@ public class MetaDataEndpointImpl extends MetaDataProtocol implements RegionCopr
 
     }
 
-    private void mutateRowsWithLocks(final Region region, final List<Mutation> mutations, final Set<byte[]> rowsToLock,
-                                     final long nonceGroup, final long nonce) throws IOException {
-        // we need to mutate SYSTEM.CATALOG with HBase/login user if access is enabled.
-        if (this.accessCheckEnabled) {
+    /**
+     * Perform atomic mutations on rows within a region
+     *
+     * @param accessCheckEnabled Use the login user to mutate rows if enabled
+     * @param region Region containing rows to be mutated
+     * @param mutations List of mutations for rows that must be contained within the region
+     * @param rowsToLock Rows to lock
+     * @param nonceGroup Optional nonce group of the operation
+     * @param nonce Optional nonce of the operation
+     * @throws IOException
+     */
+    static void mutateRowsWithLocks(final boolean accessCheckEnabled, final Region region,
+            final List<Mutation> mutations, final Set<byte[]> rowsToLock, final long nonceGroup,
+            final long nonce) throws IOException {
+        // We need to mutate SYSTEM.CATALOG or SYSTEM.CHILD_LINK with HBase/login user
+        // if access is enabled.
+        if (accessCheckEnabled) {
             User.runAsLoginUser(new PrivilegedExceptionAction<Void>() {
                 @Override
                 public Void run() throws Exception {

@@ -58,7 +58,7 @@
   <parent>
     <groupId>org.apache</groupId>
     <artifactId>apache</artifactId>
-    <version>14</version>
+    <version>21</version>
   </parent>
 
   <scm>
@@ -107,7 +107,7 @@
     <jodatime.version>1.6</jodatime.version>
     <joni.version>2.1.2</joni.version>
     <avatica.version>1.12.0</avatica.version>
-    <jetty.version>9.3.19.v20170502</jetty.version>
+    <jetty.version>9.3.27.v20190418</jetty.version>
     <tephra.version>0.15.0-incubating</tephra.version>
     <omid.version>1.0.1</omid.version>
     <spark.version>2.4.0</spark.version>
@@ -119,16 +119,10 @@
     <!-- Test Dependencies -->
     <mockito-all.version>1.8.5</mockito-all.version>
     <junit.version>4.12</junit.version>
-    <bouncycastle.version>1.46</bouncycastle.version>
 
     <!-- Plugin versions -->
     <maven-eclipse-plugin.version>2.9</maven-eclipse-plugin.version>
     <maven-build-helper-plugin.version>1.9.1</maven-build-helper-plugin.version>
-    <maven-surefire-plugin.version>2.22.2</maven-surefire-plugin.version>
-    <maven-failsafe-plugin.version>2.22.2</maven-failsafe-plugin.version>
-
-    <maven-dependency-plugin.version>2.1</maven-dependency-plugin.version>
-    <maven.assembly.version>2.5.2</maven.assembly.version>
 
     <!-- Plugin options -->
     <numForkedUT>8</numForkedUT>
@@ -149,7 +143,6 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
-          <version>3.0</version>
           <configuration>
             <source>1.8</source>
             <target>1.8</target>
@@ -184,7 +177,6 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-install-plugin</artifactId>
-          <version>2.5.2</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
@@ -193,7 +185,6 @@
         </plugin>
         <plugin>
           <artifactId>maven-assembly-plugin</artifactId>
-          <version>${maven.assembly.version}</version>
         </plugin>
         <plugin>
           <groupId>org.apache.rat</groupId>
@@ -242,7 +233,6 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-failsafe-plugin</artifactId>
-          <version>${maven-failsafe-plugin.version}</version>
           <executions>
             <execution>
               <id>ParallelStatsEnabledTest</id>
@@ -352,7 +342,6 @@
         </plugin>
         <plugin>
           <artifactId>maven-dependency-plugin</artifactId>
-          <version>${maven-dependency-plugin.version}</version>
           <executions>
             <execution>
               <id>create-mrapp-generated-classpath</id>
@@ -370,7 +359,6 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-shade-plugin</artifactId>
-          <version>3.1.1</version>
         </plugin>
         <plugin>
           <!-- Allows us to get the apache-ds bundle artifacts -->
@@ -408,7 +396,6 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-source-plugin</artifactId>
-        <version>2.2.1</version>
         <executions>
           <execution>
             <id>attach-sources</id>
@@ -422,7 +409,6 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-javadoc-plugin</artifactId>
-        <version>2.9</version>
         <configuration>
           <quiet>true</quiet>
           <links>
@@ -442,7 +428,6 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>${maven-surefire-plugin.version}</version>
         <configuration>
           <forkCount>${numForkedUT}</forkCount>
           <reuseForks>true</reuseForks>
@@ -456,7 +441,6 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
-        <version>2.4</version>
         <executions>
           <execution>
             <phase>prepare-package
@@ -470,7 +454,6 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-site-plugin</artifactId>
-        <version>3.7.1</version>
       </plugin>
       <plugin>
         <groupId>org.apache.rat</groupId>
@@ -804,6 +787,10 @@
             <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
           </exclusion>
+          <exclusion>
+            <groupId>org.apache.httpcomponents</groupId>
+            <artifactId>httpcore</artifactId>
+          </exclusion>
         </exclusions>
       </dependency>
       <dependency>
@@ -1063,12 +1050,6 @@
         <version>${servlet.api.version}</version>
       </dependency>
       <dependency>
-        <groupId>org.bouncycastle</groupId>
-        <artifactId>bcprov-jdk16</artifactId>
-        <version>${bouncycastle.version}</version>
-        <scope>test</scope>
-      </dependency>
-       <dependency>
         <groupId>com.lmax</groupId>
         <artifactId>disruptor</artifactId>
         <version>${disruptor.version}</version>
@@ -1097,7 +1078,6 @@
           <plugin>
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-gpg-plugin</artifactId>
-            <version>1.6</version>
             <executions>
               <execution>
                 <id>sign-artifacts</id>
@@ -1126,7 +1106,6 @@
           <plugin>
               <groupId>org.apache.maven.plugins</groupId>
               <artifactId>maven-project-info-reports-plugin</artifactId>
-              <version>3.0.0</version>
           </plugin>
           <plugin>
               <groupId>org.codehaus.mojo</groupId>

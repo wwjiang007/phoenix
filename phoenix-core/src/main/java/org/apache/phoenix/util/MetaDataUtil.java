@@ -58,6 +58,7 @@ import org.apache.hadoop.hbase.ipc.HBaseRpcController;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.AdminService;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.ipc.RemoteException;
+import org.apache.phoenix.coprocessor.MetaDataEndpointImpl;
 import org.apache.phoenix.coprocessor.MetaDataProtocol;
 import org.apache.phoenix.hbase.index.util.GenericKeyValueBuilder;
 import org.apache.phoenix.hbase.index.util.ImmutableBytesPtr;
@@ -904,10 +905,16 @@ public class MetaDataUtil {
         byte[] physicalTableName = Bytes.toBytes(SchemaUtil.getTableNameFromFullName(view.getPhysicalName().getString()));
         return SchemaUtil.getTableKey(ByteUtil.EMPTY_BYTE_ARRAY, physicalTableSchemaName, physicalTableName);
     }
-    
-	public static List<Mutation> removeChildLinks(List<Mutation> catalogMutations) {
-		List<Mutation> childLinks = Lists.newArrayList();
-		Iterator<Mutation> iter = catalogMutations.iterator();
+
+    /**
+     * Extract mutations of link type {@link PTable.LinkType#CHILD_TABLE} from the list of mutations.
+     * The child link mutations will be sent to SYSTEM.CHILD_LINK and other mutations to SYSTEM.CATALOG
+     * @param metadataMutations total list of mutations
+     * @return list of mutations pertaining to parent-child links
+     */
+	public static List<Mutation> removeChildLinkMutations(List<Mutation> metadataMutations) {
+		List<Mutation> childLinkMutations = Lists.newArrayList();
+		Iterator<Mutation> iter = metadataMutations.iterator();
 		while (iter.hasNext()) {
 			Mutation m = iter.next();
 			for (Cell kv : m.getFamilyCellMap().get(PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES)) {
@@ -918,12 +925,12 @@ public class MetaDataUtil {
 						&& ((Bytes.compareTo(kv.getValueArray(), kv.getValueOffset(), kv.getValueLength(),
 								LinkType.CHILD_TABLE.getSerializedValueAsByteArray(), 0,
 								LinkType.CHILD_TABLE.getSerializedValueAsByteArray().length) == 0))) {
-					childLinks.add(m);
+					childLinkMutations.add(m);
 					iter.remove();
 				}
 			}
 		}
-		return childLinks;
+		return childLinkMutations;
 	}
 
 	public static IndexType getIndexType(List<Mutation> tableMetaData, KeyValueBuilder builder,
@@ -931,6 +938,23 @@ public class MetaDataUtil {
         if (getMutationValue(getPutOnlyTableHeaderRow(tableMetaData), PhoenixDatabaseMetaData.INDEX_TYPE_BYTES, builder,
                 value)) { return IndexType.fromSerializedValue(value.get()[value.getOffset()]); }
         return null;
+    }
+
+	/**
+     * Retrieve the viewIndexId datatype from create request.
+     *
+     * @see MetaDataEndpointImpl#createTable(com.google.protobuf.RpcController,
+     *      org.apache.phoenix.coprocessor.generated.MetaDataProtos.CreateTableRequest,
+     *      com.google.protobuf.RpcCallback)
+     */
+    public static PDataType<?> getIndexDataType(List<Mutation> tableMetaData,
+            KeyValueBuilder builder, ImmutableBytesWritable value) {
+        if (getMutationValue(getPutOnlyTableHeaderRow(tableMetaData),
+                PhoenixDatabaseMetaData.VIEW_INDEX_ID_DATA_TYPE_BYTES, builder, value)) {
+            return PDataType.fromTypeId(
+                    PInteger.INSTANCE.getCodec().decodeInt(value, SortOrder.getDefault()));
+        }
+        return getLegacyViewIndexIdDataType();
     }
 
     public static PColumn getColumn(int pkCount, byte[][] rowKeyMetaData, PTable table) throws ColumnFamilyNotFoundException, ColumnNotFoundException {

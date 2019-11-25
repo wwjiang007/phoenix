@@ -47,7 +47,6 @@ import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Table;
-import org.apache.hadoop.hbase.client.TableDescriptor;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
@@ -84,7 +83,6 @@ import org.apache.phoenix.schema.PColumn;
 import org.apache.phoenix.schema.PIndexState;
 import org.apache.phoenix.schema.PMetaData;
 import org.apache.phoenix.schema.PName;
-import org.apache.phoenix.schema.PNameFactory;
 import org.apache.phoenix.schema.PRow;
 import org.apache.phoenix.schema.PTable;
 import org.apache.phoenix.schema.PTableRef;
@@ -104,9 +102,7 @@ import org.apache.phoenix.util.EncodedColumnsUtil;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.apache.phoenix.util.IndexUtil;
 import org.apache.phoenix.util.LogUtil;
-import org.apache.phoenix.util.MetaDataUtil;
 import org.apache.phoenix.util.PhoenixKeyValueUtil;
-import org.apache.phoenix.util.PhoenixRuntime;
 import org.apache.phoenix.util.SQLCloseable;
 import org.apache.phoenix.util.SchemaUtil;
 import org.apache.phoenix.util.ServerUtil;
@@ -161,7 +157,11 @@ public class MutationState implements SQLCloseable {
     }
 
     public MutationState(MutationState mutationState) {
-        this(mutationState.maxSize, mutationState.maxSizeBytes, mutationState.connection, true, mutationState
+        this(mutationState, mutationState.connection);
+    }
+
+    public MutationState(MutationState mutationState, PhoenixConnection connection) {
+        this(mutationState.maxSize, mutationState.maxSizeBytes, connection, true, mutationState
                 .getPhoenixTransactionContext());
     }
 
@@ -773,8 +773,14 @@ public class MutationState implements SQLCloseable {
         // If we're auto committing, we've already validated the schema when we got the ColumnResolver,
         // so no need to do it again here.
         PTable table = tableRef.getTable();
-        MetaDataMutationResult result = client.updateCache(table.getSchemaName().getString(), table.getTableName()
-                .getString());
+
+        // We generally don't re-resolve SYSTEM tables, but if it relies on ROW_TIMESTAMP, we must
+        // get the latest timestamp in order to upsert data with the correct server-side timestamp
+        // in case the ROW_TIMESTAMP is not provided in the UPSERT statement.
+        boolean hitServerForLatestTimestamp =
+                table.getRowTimestampColPos() != -1 && table.getType() == PTableType.SYSTEM;
+        MetaDataMutationResult result = client.updateCache(table.getSchemaName().getString(),
+                table.getTableName().getString(), hitServerForLatestTimestamp);
         PTable resolvedTable = result.getTable();
         if (resolvedTable == null) { throw new TableNotFoundException(table.getSchemaName().getString(), table
                 .getTableName().getString()); }
@@ -1227,7 +1233,7 @@ public class MutationState implements SQLCloseable {
                     }
                     if (m instanceof Delete) {
                         Put put = new Put(m.getRow());
-                        put.addColumn(emptyCF, emptyCQ, IndexRegionObserver.getMaxTimestamp(m),
+                        put.addColumn(emptyCF, emptyCQ, IndexRegionObserver.getMaxTimestamp(m) - 1,
                                 IndexRegionObserver.UNVERIFIED_BYTES);
                         // The Delete gets marked as unverified in Phase 1 and gets deleted on Phase 3.
                         addToMap(unverifiedIndexMutations, tableInfo, put);
@@ -1235,15 +1241,19 @@ public class MutationState implements SQLCloseable {
                     } else if (m instanceof Put) {
                         long timestamp = IndexRegionObserver.getMaxTimestamp(m);
 
-                        // Phase 1 index mutations are set to unverified
-                        ((Put) m).addColumn(emptyCF, emptyCQ, timestamp, IndexRegionObserver.UNVERIFIED_BYTES);
-                        addToMap(unverifiedIndexMutations, tableInfo, m);
+                        // Phase 1 index mutations are set to unverified.
+                        // Just send empty with Unverified
+                        Put unverifiedPut = new Put(m.getRow());
+                        unverifiedPut.addColumn(emptyCF, emptyCQ, timestamp - 1, IndexRegionObserver.UNVERIFIED_BYTES);
+                        addToMap(unverifiedIndexMutations, tableInfo, unverifiedPut);
 
                         // Phase 3 mutations are verified
-                        Put verifiedPut = new Put(m.getRow());
-                        verifiedPut.addColumn(emptyCF, emptyCQ, timestamp,
+                        // Send entire mutation with verified
+                        // Remove the empty column prepared by Index codec as we need to change its value
+                        IndexRegionObserver.removeEmptyColumn(m, emptyCF, emptyCQ);
+                        ((Put) m).addColumn(emptyCF, emptyCQ, timestamp,
                                 IndexRegionObserver.VERIFIED_BYTES);
-                        addToMap(verifiedOrDeletedIndexMutations, tableInfo, verifiedPut);
+                        addToMap(verifiedOrDeletedIndexMutations, tableInfo, m);
                     } else {
                         addToMap(unverifiedIndexMutations, tableInfo, m);
                     }

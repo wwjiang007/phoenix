@@ -19,8 +19,11 @@ import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ExtendedCellBuilder;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
@@ -69,8 +72,11 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 
+import static org.apache.phoenix.coprocessor.MetaDataProtocol.MIN_SPLITTABLE_SYSTEM_CATALOG;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.LINK_TYPE_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.PARENT_TENANT_ID_BYTES;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME_BYTES;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_FAMILY_BYTES;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_TYPE_BYTES;
 import static org.apache.phoenix.schema.PTableImpl.getColumnsToClone;
@@ -141,10 +147,18 @@ public class ViewUtil {
     }
     
     /**
+     * Check metadata to find all child views for a given table/view
+     * @param sysCatOrsysChildLink For older (pre-4.15.0) clients, we look for child links inside SYSTEM.CATALOG,
+     *                             otherwise we look for them inside SYSTEM.CHILD_LINK
+     * @param tenantId tenantId
+     * @param schemaName table schema name
+     * @param tableName table name
+     * @param timestamp passed client-side timestamp
      * @return true if the given table has at least one child view
-     * @throws IOException 
+     * @throws IOException
      */
-    public static boolean hasChildViews(Table systemCatalog, byte[] tenantId, byte[] schemaName, byte[] tableName, long timestamp) throws IOException {
+    public static boolean hasChildViews(Table sysCatOrsysChildLink, byte[] tenantId, byte[] schemaName,
+                                        byte[] tableName, long timestamp) throws IOException {
         byte[] key = SchemaUtil.getTableKey(tenantId, schemaName, tableName);
         Scan scan = MetaDataUtil.newTableRowsScan(key, MetaDataProtocol.MIN_TABLE_TIMESTAMP, timestamp);
         SingleColumnValueFilter linkFilter =
@@ -154,28 +168,26 @@ public class ViewUtil {
                     // if we found a row with the CHILD_TABLE link type we are done and can
                     // terminate the scan
                     @Override
-                    public boolean filterAllRemaining() throws IOException {
+                    public boolean filterAllRemaining() {
                         return matchedColumn;
                     }
                 };
         linkFilter.setFilterIfMissing(true);
         scan.setFilter(linkFilter);
         scan.addColumn(TABLE_FAMILY_BYTES, LINK_TYPE_BYTES);
-        try (ResultScanner scanner = systemCatalog.getScanner(scan)) {
+        try (ResultScanner scanner = sysCatOrsysChildLink.getScanner(scan)) {
             Result result = scanner.next();
             return result!=null; 
         }
     }
 
-    public static void dropChildViews(RegionCoprocessorEnvironment env, byte[] tenantIdBytes, byte[] schemaName, byte[] tableName)
+    public static void dropChildViews(RegionCoprocessorEnvironment env, byte[] tenantIdBytes,
+            byte[] schemaName, byte[] tableName, byte[] sysCatOrSysChildLink)
             throws IOException, SQLException, ClassNotFoundException {
         Table hTable = null;
         try {
-            hTable =
-                    ServerUtil.getHTableForCoprocessorScan(env,
-                            SchemaUtil.getPhysicalTableName(
-                                    PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_NAME_BYTES,
-                                    env.getConfiguration()));
+            hTable = ServerUtil.getHTableForCoprocessorScan(env, SchemaUtil.getPhysicalTableName(
+                            sysCatOrSysChildLink, env.getConfiguration()));
         }
         catch (Exception e){
         }
@@ -213,6 +225,40 @@ public class ViewUtil {
                 }
             }
         }
+    }
+
+
+    /**
+     * Determines whether we should use SYSTEM.CATALOG or SYSTEM.CHILD_LINK to find parent->child
+     * links i.e. {@link LinkType#CHILD_TABLE}.
+     * If the client is older than 4.15.0 and the SYSTEM.CHILD_LINK table does not exist, we use
+     * the SYSTEM.CATALOG table. In all other cases, we use the SYSTEM.CHILD_LINK table.
+     * This is required for backwards compatibility.
+     * @param clientVersion client version
+     * @param conf server-side configuration
+     * @return name of the system table to be used
+     * @throws SQLException
+     */
+    public static TableName getSystemTableForChildLinks(int clientVersion,
+            Configuration conf) throws SQLException, IOException {
+        byte[] fullTableName = SYSTEM_CHILD_LINK_NAME_BYTES;
+        if (clientVersion < MIN_SPLITTABLE_SYSTEM_CATALOG) {
+            try (PhoenixConnection connection = QueryUtil.getConnectionOnServer(
+                    conf).unwrap(PhoenixConnection.class);
+                    Admin admin = connection.getQueryServices().getAdmin()) {
+
+                // If this is an old client and the CHILD_LINK table doesn't exist i.e. metadata
+                // hasn't been updated since there was never a connection from a 4.15 client
+                if (!admin.tableExists(SchemaUtil.getPhysicalTableName(
+                        SYSTEM_CHILD_LINK_NAME_BYTES, conf))) {
+                    fullTableName = SYSTEM_CATALOG_NAME_BYTES;
+                }
+            } catch (ClassNotFoundException e) {
+                logger.error("Error getting a connection on the server : " + e);
+                throw new SQLException(e);
+            }
+        }
+        return SchemaUtil.getPhysicalTableName(fullTableName, conf);
     }
 
     public static boolean isDivergedView(PTable view) {

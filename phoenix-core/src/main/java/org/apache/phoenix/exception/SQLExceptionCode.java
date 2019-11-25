@@ -35,6 +35,7 @@ import org.apache.phoenix.schema.ConcurrentTableMutationException;
 import org.apache.phoenix.schema.FunctionAlreadyExistsException;
 import org.apache.phoenix.schema.FunctionNotFoundException;
 import org.apache.phoenix.schema.IndexNotFoundException;
+import org.apache.phoenix.schema.PTable;
 import org.apache.phoenix.schema.PTableType;
 import org.apache.phoenix.schema.ReadOnlyTableException;
 import org.apache.phoenix.schema.SchemaAlreadyExistsException;
@@ -410,6 +411,12 @@ public enum SQLExceptionCode {
     CANNOT_SET_GUIDE_POST_WIDTH(1139, "XCL39", "Guide post width can only be set on base data tables"),
     CANNOT_CREATE_VIEWS_ON_SYSTEM_TABLES(1141, "XCL41", "Cannot create views on tables of type" +
             PTableType.SYSTEM),
+    UNABLE_TO_CREATE_CHILD_LINK(1142, "XCL42", "Error creating parent-child link (Link type=" +
+            PTable.LinkType.CHILD_TABLE + ") for view"),
+    UNABLE_TO_UPDATE_PARENT_TABLE(1143, "XCL43", "Error Updating the parent table"),
+    UNABLE_TO_DELETE_CHILD_LINK(1144, "XCL44", "Error deleting parent-child link (Link type=" +
+            PTable.LinkType.CHILD_TABLE + ") for view"),
+
     /**
      * Implementation defined class. Phoenix internal error. (errorcode 20, sqlstate INT).
      */
@@ -483,12 +490,11 @@ public enum SQLExceptionCode {
 
     STATS_COLLECTION_DISABLED_ON_SERVER(1401, "STS01", "Stats collection attempted but is disabled on server"),
 
-    CANNOT_UPSERT_WITH_SCN_FOR_ROW_TIMSTAMP_COLUMN(901,"43M12",
+    CANNOT_UPSERT_WITH_SCN_FOR_ROW_TIMESTAMP_COLUMN(901,"43M12",
             "Cannot use a connection with SCN set to upsert data for " +
                     "table with ROW_TIMESTAMP column."),
-    CANNOT_UPSERT_WITH_SCN_FOR_MUTABLE_TABLE_WITH_INDEXES(903,"43M14",
-            "Cannot use a connection with SCN set to " +
-                    "upsert data for a mutable table with indexes.");
+    CANNOT_UPSERT_WITH_SCN_FOR_TABLE_WITH_INDEXES(903,"43M14",
+            "Cannot use a connection with SCN set to upsert data for a table with indexes.");
 
 
     private final int errorCode;

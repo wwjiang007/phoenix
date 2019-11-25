@@ -78,6 +78,7 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.STORE_NULLS;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYNC_INDEX_CREATED_DATE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CATALOG_SCHEMA;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CATALOG_TABLE;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_TABLE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_FUNCTION_TABLE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_NAME;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_SCHEM;
@@ -97,7 +98,6 @@ import static org.apache.phoenix.query.QueryConstants.BASE_TABLE_BASE_COLUMN_COU
 import static org.apache.phoenix.query.QueryConstants.DEFAULT_COLUMN_FAMILY;
 import static org.apache.phoenix.query.QueryConstants.ENCODED_CQ_COUNTER_INITIAL_VALUE;
 import static org.apache.phoenix.query.QueryServices.DROP_METADATA_ATTRIB;
-import static org.apache.phoenix.query.QueryServices.LONG_VIEW_INDEX_ENABLED_ATTRIB;
 import static org.apache.phoenix.query.QueryServicesOptions.DEFAULT_DROP_METADATA;
 import static org.apache.phoenix.query.QueryServicesOptions.DEFAULT_RUN_UPDATE_STATS_ASYNC;
 import static org.apache.phoenix.schema.PTable.EncodedCQCounter.NULL_COUNTER;
@@ -520,12 +520,9 @@ public class MetaDataClient {
         return updateCache(schemaName, tableName, false);
     }
 
-    private MetaDataMutationResult updateCache(String schemaName, String tableName, boolean alwaysHitServer) throws SQLException {
+    public MetaDataMutationResult updateCache(String schemaName, String tableName,
+            boolean alwaysHitServer) throws SQLException {
         return updateCache(connection.getTenantId(), schemaName, tableName, alwaysHitServer);
-    }
-
-    public MetaDataMutationResult updateCache(PName tenantId, String schemaName, String tableName) throws SQLException {
-        return updateCache(tenantId, schemaName, tableName, false);
     }
 
     public MetaDataMutationResult updateCache(PName tenantId, String schemaName, String tableName, boolean alwaysHitServer) throws SQLException {
@@ -598,14 +595,11 @@ public class MetaDataClient {
             connection.getMutationState().startTransaction(table.getTransactionProvider());
         }
         resolvedTimestamp = resolvedTimestamp==null ? TransactionUtil.getResolvedTimestamp(connection, isTransactional, HConstants.LATEST_TIMESTAMP) : resolvedTimestamp;
-        // Do not make rpc to getTable if
-        // 1. table is a system table
-        // 2. table was already resolved as of that timestamp
-        // 3. table does not have a ROW_TIMESTAMP column and age is less then UPDATE_CACHE_FREQUENCY
-        if (table != null && !alwaysHitServer
-                && (systemTable || resolvedTimestamp == tableResolvedTimestamp || 
-                (table.getRowTimestampColPos() == -1 && connection.getMetaDataCache().getAge(tableRef) < table.getUpdateCacheFrequency() ))) {
-            return new MetaDataMutationResult(MutationCode.TABLE_ALREADY_EXISTS, QueryConstants.UNSET_TIMESTAMP, table);
+
+        if (avoidRpcToGetTable(alwaysHitServer, resolvedTimestamp, systemTable, table, tableRef,
+                tableResolvedTimestamp)) {
+            return new MetaDataMutationResult(MutationCode.TABLE_ALREADY_EXISTS,
+                    QueryConstants.UNSET_TIMESTAMP, table);
         }
 
         MetaDataMutationResult result;
@@ -722,6 +716,20 @@ public class MetaDataClient {
         }
 
         return result;
+    }
+
+    // Do not make rpc to getTable if
+    // 1. table is a system table that does not have a ROW_TIMESTAMP column OR
+    // 2. table was already resolved as of that timestamp OR
+    // 3. table does not have a ROW_TIMESTAMP column and age is less then UPDATE_CACHE_FREQUENCY
+    private boolean avoidRpcToGetTable(boolean alwaysHitServer, Long resolvedTimestamp,
+            boolean systemTable, PTable table, PTableRef tableRef, long tableResolvedTimestamp) {
+        return table != null && !alwaysHitServer &&
+                (systemTable && table.getRowTimestampColPos() == -1 ||
+                        resolvedTimestamp == tableResolvedTimestamp ||
+                        (table.getRowTimestampColPos() == -1 &&
+                                connection.getMetaDataCache().getAge(tableRef) <
+                                        table.getUpdateCacheFrequency()));
     }
 
     public MetaDataMutationResult updateCache(String schemaName) throws SQLException {
@@ -1649,7 +1657,7 @@ public class MetaDataClient {
             PrimaryKeyConstraint pk = FACTORY.primaryKey(null, allPkColumns);
             tableProps.put(MetaDataUtil.DATA_TABLE_NAME_PROP_NAME, dataTable.getName().getString());
             CreateTableStatement tableStatement = FACTORY.createTable(indexTableName, statement.getProps(), columnDefs, pk, statement.getSplitNodes(), PTableType.INDEX, statement.ifNotExists(), null, null, statement.getBindCount(), null);
-            table = createTableInternal(tableStatement, splits, dataTable, null, null, MetaDataUtil.getViewIndexIdDataType(),null, null, allocateIndexId, statement.getIndexType(), asyncCreatedDate, tableProps, commonFamilyProps);
+            table = createTableInternal(tableStatement, splits, dataTable, null, null, getViewIndexDataType() ,null, null, allocateIndexId, statement.getIndexType(), asyncCreatedDate, tableProps, commonFamilyProps);
         }
         finally {
             deleteMutexCells(physicalSchemaName, physicalTableName, acquiredColumnMutexSet);
@@ -2825,7 +2833,7 @@ public class MetaDataClient {
             } else {
                 tableUpsert.setBoolean(28, useStatsForParallelizationProp);
             }
-            tableUpsert.setInt(29, Types.BIGINT);
+            tableUpsert.setInt(29, viewIndexIdType.getSqlType());
             tableUpsert.execute();
 
             if (asyncCreatedDate != null) {
@@ -2894,6 +2902,11 @@ public class MetaDataClient {
                 .setSchemaName(schemaName).setTableName(tableName).build().buildException();
             case TOO_MANY_INDEXES:
                 throw new SQLExceptionInfo.Builder(SQLExceptionCode.TOO_MANY_INDEXES)
+                        .setSchemaName(SchemaUtil.getSchemaNameFromFullName(parent.getPhysicalName().getString()))
+                        .setTableName(SchemaUtil.getTableNameFromFullName(parent.getPhysicalName().getString())).build()
+                        .buildException();
+            case UNABLE_TO_UPDATE_PARENT_TABLE:
+                throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNABLE_TO_UPDATE_PARENT_TABLE)
                         .setSchemaName(SchemaUtil.getSchemaNameFromFullName(parent.getPhysicalName().getString()))
                         .setTableName(SchemaUtil.getTableNameFromFullName(parent.getPhysicalName().getString())).build()
                         .buildException();
@@ -3142,13 +3155,16 @@ public class MetaDataClient {
                 throw new NewerTableAlreadyExistsException(schemaName, tableName, result.getTable());
             case UNALLOWED_TABLE_MUTATION:
                 throw new SQLExceptionInfo.Builder(SQLExceptionCode.CANNOT_MUTATE_TABLE)
-
-                .setSchemaName(schemaName).setTableName(tableName).build().buildException();
+                        .setSchemaName(schemaName).setTableName(tableName).build().buildException();
+            case UNABLE_TO_DELETE_CHILD_LINK:
+                throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNABLE_TO_DELETE_CHILD_LINK)
+                        .setSchemaName(schemaName).setTableName(tableName).build().buildException();
             default:
                 connection.removeTable(tenantId, SchemaUtil.getTableName(schemaName, tableName), parentTableName, result.getMutationTime());
 
                 if (table != null) {
-                    boolean dropMetaData = false;
+                    boolean dropMetaData = connection.getQueryServices().getProps()
+                            .getBoolean(DROP_METADATA_ATTRIB, DEFAULT_DROP_METADATA);
                     long ts = (scn == null ? result.getMutationTime() : scn);
                     List<TableRef> tableRefs = Lists.newArrayListWithExpectedSize(2 + table.getIndexes().size());
                     connection.setAutoCommit(true);
@@ -4395,11 +4411,31 @@ public class MetaDataClient {
             if (newIndexState == PIndexState.BUILDING && !isAsync) {
                 PTable index = indexRef.getTable();
                 // First delete any existing rows of the index
-                Long scn = connection.getSCN();
-                long ts = scn == null ? HConstants.LATEST_TIMESTAMP : scn;
-                MutationPlan plan = new PostDDLCompiler(connection).compile(Collections.singletonList(indexRef), null, null, Collections.<PColumn>emptyList(), ts);
-                connection.getQueryServices().updateData(plan);
-                NamedTableNode dataTableNode = NamedTableNode.create(null, TableName.create(schemaName, dataTableName), Collections.<ColumnDef>emptyList());
+                if (index.getIndexType().equals(IndexType.GLOBAL) && index.getViewIndexId() == null){
+                    //for a global index of a normal base table, it's safe to just truncate and
+                    //rebuild. We preserve splits to reduce the amount of splitting we need to do
+                    //during rebuild
+                    org.apache.hadoop.hbase.TableName physicalTableName =
+                        org.apache.hadoop.hbase.TableName.valueOf(index.getPhysicalName().getBytes());
+                    try (Admin admin = connection.getQueryServices().getAdmin()) {
+                        admin.disableTable(physicalTableName);
+                        admin.truncateTable(physicalTableName, true);
+                        //trunateTable automatically re-enables when it's done
+                    } catch(IOException ie) {
+                        String failedTable = physicalTableName.getNameAsString();
+                        throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNKNOWN_ERROR_CODE).
+                            setMessage("Error when truncating index table [" + failedTable +
+                                "] before rebuilding: " + ie.getMessage()).
+                            setTableName(failedTable).build().buildException();
+                    }
+                } else {
+                    Long scn = connection.getSCN();
+                    long ts = scn == null ? HConstants.LATEST_TIMESTAMP : scn;
+                    MutationPlan plan = new PostDDLCompiler(connection).compile(Collections.singletonList(indexRef), null, null, Collections.<PColumn>emptyList(), ts);
+                    connection.getQueryServices().updateData(plan);
+                }
+                NamedTableNode dataTableNode = NamedTableNode.create(null,
+                    TableName.create(schemaName, dataTableName), Collections.<ColumnDef>emptyList());
                 // Next rebuild the index
                 connection.setAutoCommit(true);
                 if (connection.getSCN() != null) {
@@ -4408,6 +4444,7 @@ public class MetaDataClient {
                 TableRef dataTableRef = FromCompiler.getResolver(dataTableNode, connection).getTables().get(0);
                 return buildIndex(index, dataTableRef);
             }
+
             return new MutationState(1, 1000, connection);
         } catch (TableNotFoundException e) {
             if (!statement.ifExists()) {
