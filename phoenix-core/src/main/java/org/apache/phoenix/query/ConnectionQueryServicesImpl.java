@@ -17,12 +17,13 @@
  */
 package org.apache.phoenix.query;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder.MAX_VERSIONS;
-import static org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder.TTL;
-import static org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder.REPLICATION_SCOPE;
 import static org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder.KEEP_DELETED_CELLS;
+import static org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder.MAX_VERSIONS;
+import static org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder.REPLICATION_SCOPE;
+import static org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder.TTL;
 import static org.apache.phoenix.coprocessor.MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP;
 import static org.apache.phoenix.coprocessor.MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP_4_15_0;
+import static org.apache.phoenix.coprocessor.MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP_4_16_0;
 import static org.apache.phoenix.coprocessor.MetaDataProtocol.PHOENIX_MAJOR_VERSION;
 import static org.apache.phoenix.coprocessor.MetaDataProtocol.PHOENIX_MINOR_VERSION;
 import static org.apache.phoenix.coprocessor.MetaDataProtocol.PHOENIX_PATCH_NUMBER;
@@ -68,8 +69,8 @@ import static org.apache.phoenix.util.UpgradeUtil.addParentToChildLinks;
 import static org.apache.phoenix.util.UpgradeUtil.addViewIndexToParentLinks;
 import static org.apache.phoenix.util.UpgradeUtil.getSysCatalogSnapshotName;
 import static org.apache.phoenix.util.UpgradeUtil.moveChildLinks;
-import static org.apache.phoenix.util.UpgradeUtil.upgradeTo4_5_0;
 import static org.apache.phoenix.util.UpgradeUtil.syncTableAndIndexProperties;
+import static org.apache.phoenix.util.UpgradeUtil.upgradeTo4_5_0;
 
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
@@ -110,7 +111,6 @@ import java.util.regex.Pattern;
 
 import javax.annotation.concurrent.GuardedBy;
 
-import com.google.common.base.Strings;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionLocation;
@@ -164,8 +164,8 @@ import org.apache.phoenix.coprocessor.SequenceRegionObserver;
 import org.apache.phoenix.coprocessor.ServerCachingEndpointImpl;
 import org.apache.phoenix.coprocessor.TaskRegionObserver;
 import org.apache.phoenix.coprocessor.UngroupedAggregateRegionObserver;
-import org.apache.phoenix.coprocessor.generated.ChildLinkMetaDataProtos.CreateViewAddChildLinkRequest;
 import org.apache.phoenix.coprocessor.generated.ChildLinkMetaDataProtos.ChildLinkMetaDataService;
+import org.apache.phoenix.coprocessor.generated.ChildLinkMetaDataProtos.CreateViewAddChildLinkRequest;
 import org.apache.phoenix.coprocessor.generated.MetaDataProtos;
 import org.apache.phoenix.coprocessor.generated.MetaDataProtos.AddColumnRequest;
 import org.apache.phoenix.coprocessor.generated.MetaDataProtos.ClearCacheRequest;
@@ -216,6 +216,7 @@ import org.apache.phoenix.parse.PSchema;
 import org.apache.phoenix.protobuf.ProtobufUtil;
 import org.apache.phoenix.schema.ColumnAlreadyExistsException;
 import org.apache.phoenix.schema.ColumnFamilyNotFoundException;
+import org.apache.phoenix.schema.ConnectionProperty;
 import org.apache.phoenix.schema.EmptySequenceCacheException;
 import org.apache.phoenix.schema.FunctionNotFoundException;
 import org.apache.phoenix.schema.MetaDataClient;
@@ -278,13 +279,13 @@ import org.apache.phoenix.util.SchemaUtil;
 import org.apache.phoenix.util.ServerUtil;
 import org.apache.phoenix.util.TimeKeeper;
 import org.apache.phoenix.util.UpgradeUtil;
-import org.apache.twill.zookeeper.ZKClientService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -326,7 +327,6 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
     private final boolean returnSequenceValues ;
 
     private Connection connection;
-    private ZKClientService txZKClientService;
     private volatile boolean initialized;
     private volatile int nSequenceSaltBuckets;
 
@@ -681,7 +681,8 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
             throwConnectionClosedIfNullMetaData();
             PMetaData metaData = latestMetaData;
             PTable table;
-            long endTime = System.currentTimeMillis() + DEFAULT_OUT_OF_ORDER_MUTATIONS_WAIT_TIME_MS;
+            long endTime = EnvironmentEdgeManager.currentTimeMillis() +
+                DEFAULT_OUT_OF_ORDER_MUTATIONS_WAIT_TIME_MS;
             while (true) {
                 try {
                     try {
@@ -703,7 +704,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                         }
                     } catch (TableNotFoundException e) {
                     }
-                    long waitTime = endTime - System.currentTimeMillis();
+                    long waitTime = endTime - EnvironmentEdgeManager.currentTimeMillis();
                     // We waited long enough - just remove the table from the cache
                     // and the next time it's used it'll be pulled over from the server.
                     if (waitTime <= 0) {
@@ -752,16 +753,32 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
         });
     }
 
+    /**
+     * Check that the supplied connection properties are set to valid values.
+     * @param info The properties to be validated.
+     * @throws IllegalArgumentException when a property is not set to a valid value.
+     */
+    private void validateConnectionProperties(Properties info) {
+        if (info.get(DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB) != null) {
+            if (LOGGER.isInfoEnabled()) {
+                LOGGER.info("Connection's " + DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB + " set to " +
+                        info.get(DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB));
+            }
+            ConnectionProperty.UPDATE_CACHE_FREQUENCY.getValue(
+                    info.getProperty(DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB));
+        }
+    }
 
     @Override
     public PhoenixConnection connect(String url, Properties info) throws SQLException {
         checkClosed();
         PMetaData metadata = latestMetaData;
         throwConnectionClosedIfNullMetaData();
+        validateConnectionProperties(info);
         metadata = metadata.clone();
+
         return new PhoenixConnection(this, url, info, metadata);
     }
-
 
     private ColumnFamilyDescriptor generateColumnFamilyDescriptor(Pair<byte[],Map<String,Object>> family, PTableType tableType) throws SQLException {
         ColumnFamilyDescriptorBuilder columnDescBuilder = ColumnFamilyDescriptorBuilder.newBuilder(family.getFirst());
@@ -888,7 +905,8 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                 }
             }
         }
-        addCoprocessors(physicalTableName, tableDescriptorBuilder, tableType, tableProps);
+        addCoprocessors(physicalTableName, tableDescriptorBuilder,
+            tableType, tableProps, existingDesc);
 
         // PHOENIX-3072: Set index priority if this is a system table or index table
         if (tableType == PTableType.SYSTEM) {
@@ -914,7 +932,9 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
     }
 
 
-    private void addCoprocessors(byte[] tableName, TableDescriptorBuilder builder, PTableType tableType, Map<String,Object> tableProps) throws SQLException {
+    private void addCoprocessors(byte[] tableName, TableDescriptorBuilder builder,
+                                 PTableType tableType, Map<String,Object> tableProps,
+                                 TableDescriptor existingDesc) throws SQLException {
         // The phoenix jar must be available on HBase classpath
         int priority = props.getInt(QueryServices.COPROCESSOR_PRIORITY_ATTRIB, QueryServicesOptions.DEFAULT_COPROCESSOR_PRIORITY);
         try {
@@ -985,23 +1005,29 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                     if (newDesc.hasCoprocessor(PhoenixTransactionalIndexer.class.getName())) {
                         builder.removeCoprocessor(PhoenixTransactionalIndexer.class.getName());
                     }
-                    if (indexRegionObserverEnabled) {
-                        if (newDesc.hasCoprocessor(Indexer.class.getName())) {
-                            builder.removeCoprocessor(Indexer.class.getName());
-                        }
-                        if (!newDesc.hasCoprocessor(IndexRegionObserver.class.getName())) {
-                            Map<String, String> opts = Maps.newHashMapWithExpectedSize(1);
-                            opts.put(NonTxIndexBuilder.CODEC_CLASS_NAME_KEY, PhoenixIndexCodec.class.getName());
-                            IndexRegionObserver.enableIndexing(builder, PhoenixIndexBuilder.class, opts, priority);
-                        }
-                    } else {
-                        if (newDesc.hasCoprocessor(IndexRegionObserver.class.getName())) {
-                            builder.removeCoprocessor(IndexRegionObserver.class.getName());
-                        }
-                        if (!newDesc.hasCoprocessor(Indexer.class.getName())) {
-                            Map<String, String> opts = Maps.newHashMapWithExpectedSize(1);
-                            opts.put(NonTxIndexBuilder.CODEC_CLASS_NAME_KEY, PhoenixIndexCodec.class.getName());
-                            Indexer.enableIndexing(builder, PhoenixIndexBuilder.class, opts, priority);
+                    // we only want to mess with the indexing coprocs if we're on the original
+                    // CREATE statement. Otherwise, if we're on an ALTER or CREATE TABLE
+                    // IF NOT EXISTS of an existing table, we should leave them unaltered,
+                    // because they should be upgraded or downgraded using the IndexUpgradeTool
+                    if (!doesPhoenixTableAlreadyExist(existingDesc)) {
+                        if (indexRegionObserverEnabled) {
+                            if (newDesc.hasCoprocessor(Indexer.class.getName())) {
+                                builder.removeCoprocessor(Indexer.class.getName());
+                            }
+                            if (!newDesc.hasCoprocessor(IndexRegionObserver.class.getName())) {
+                                Map<String, String> opts = Maps.newHashMapWithExpectedSize(1);
+                                opts.put(NonTxIndexBuilder.CODEC_CLASS_NAME_KEY, PhoenixIndexCodec.class.getName());
+                                IndexRegionObserver.enableIndexing(builder, PhoenixIndexBuilder.class, opts, priority);
+                            }
+                        } else {
+                            if (newDesc.hasCoprocessor(IndexRegionObserver.class.getName())) {
+                                builder.removeCoprocessor(IndexRegionObserver.class.getName());
+                            }
+                            if (!newDesc.hasCoprocessor(Indexer.class.getName())) {
+                                Map<String, String> opts = Maps.newHashMapWithExpectedSize(1);
+                                opts.put(NonTxIndexBuilder.CODEC_CLASS_NAME_KEY, PhoenixIndexCodec.class.getName());
+                                Indexer.enableIndexing(builder, PhoenixIndexBuilder.class, opts, priority);
+                            }
                         }
                     }
                 }
@@ -1062,7 +1088,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                 }
             } else {
                 // Remove all potential transactional coprocessors
-                for (TransactionFactory.Provider aprovider : TransactionFactory.Provider.values()) {
+                for (TransactionFactory.Provider aprovider : TransactionFactory.Provider.available()) {
                     Class<? extends RegionObserver> coprocessorClass = aprovider.getTransactionProvider().getCoprocessor();
                     Class<? extends RegionObserver> coprocessorGCClass = aprovider.getTransactionProvider().getGCCoprocessor();
                     if (coprocessorClass != null && newDesc.hasCoprocessor(coprocessorClass.getName())) {
@@ -1082,7 +1108,24 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
         TransactionFactory.Provider provider = (TransactionFactory.Provider)TableProperty.TRANSACTION_PROVIDER.getValue(tableProps);
         return provider;
     }
-    
+
+    private boolean doesPhoenixTableAlreadyExist(TableDescriptor existingDesc) {
+        //if the table descriptor already has Phoenix coprocs, we assume it's
+        //already gone through a Phoenix create statement once
+        if (existingDesc == null){
+            return false;
+        }
+        boolean hasScanObserver = existingDesc.hasCoprocessor(ScanRegionObserver.class.getName());
+        boolean hasUnAggObserver = existingDesc.hasCoprocessor(
+            UngroupedAggregateRegionObserver.class.getName());
+        boolean hasGroupedObserver = existingDesc.hasCoprocessor(
+            GroupedAggregateRegionObserver.class.getName());
+        boolean hasIndexObserver = existingDesc.hasCoprocessor(Indexer.class.getName())
+            || existingDesc.hasCoprocessor(IndexRegionObserver.class.getName())
+            || existingDesc.hasCoprocessor(GlobalIndexChecker.class.getName());
+        return hasScanObserver && hasUnAggObserver && hasGroupedObserver && hasIndexObserver;
+    }
+
     private static interface RetriableOperation {
         boolean checkForCompletion() throws TimeoutException, IOException;
         String getOperationName();
@@ -1279,7 +1322,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
 
             TableDescriptorBuilder newDesc = generateTableDescriptor(physicalTableName, existingDesc, tableType, props, families,
                     splits, isNamespaceMapped);
-            
+
             if (!tableExist) {
                 if (SchemaUtil.isSystemTable(physicalTableName) && !isUpgradeRequired() && (!isAutoUpgradeEnabled || isDoNotUpgradePropSet)) {
                     // Disallow creating the SYSTEM.CATALOG or SYSTEM:CATALOG HBase table
@@ -1406,7 +1449,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
     }
     
     private static boolean hasTxCoprocessor(TableDescriptor descriptor) {
-        for (TransactionFactory.Provider provider : TransactionFactory.Provider.values()) {
+        for (TransactionFactory.Provider provider : TransactionFactory.Provider.available()) {
             Class<? extends RegionObserver> coprocessorClass = provider.getTransactionProvider().getCoprocessor();
             if (coprocessorClass != null && descriptor.hasCoprocessor(coprocessorClass.getName())) {
                 return true;
@@ -1444,20 +1487,10 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
         return MetaDataUtil.decodeHasIndexWALCodec(serverVersion);
     }
 
-    private static boolean isCompatible(Long serverVersion) {
-        if (serverVersion == null) {
-            return false;
-        }
-        return MetaDataUtil.areClientAndServerCompatible(serverVersion);
-    }
 
     private void checkClientServerCompatibility(byte[] metaTable) throws SQLException,
             AccessDeniedException {
-        StringBuilder buf = new StringBuilder("Newer Phoenix clients can't communicate with older "
-                + "Phoenix servers. The following servers require an updated "
-                + QueryConstants.DEFAULT_COPROCESS_JAR_NAME
-                + " to be put in the classpath of HBase: ");
-        boolean isIncompatible = false;
+        StringBuilder errorMessage = new StringBuilder();
         int minHBaseVersion = Integer.MAX_VALUE;
         boolean isTableNamespaceMappingEnabled = false;
         long systemCatalogTimestamp = Long.MAX_VALUE;
@@ -1478,33 +1511,58 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
 
             ht = this.getTable(metaTable);
             final byte[] tablekey = PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME_BYTES;
-            final Map<byte[], GetVersionResponse> results =
-                    ht.coprocessorService(MetaDataService.class, tablekey, tablekey, new Batch.Call<MetaDataService,GetVersionResponse>() {
-                        @Override
-                        public GetVersionResponse call(MetaDataService instance) throws IOException {
-                            ServerRpcController controller = new ServerRpcController();
-                            BlockingRpcCallback<GetVersionResponse> rpcCallback =
-                                    new BlockingRpcCallback<>();
-                            GetVersionRequest.Builder builder = GetVersionRequest.newBuilder();
-                            builder.setClientVersion(VersionUtil.encodeVersion(PHOENIX_MAJOR_VERSION, PHOENIX_MINOR_VERSION, PHOENIX_PATCH_NUMBER));
-                            instance.getVersion(controller, builder.build(), rpcCallback);
-                            if(controller.getFailedOn() != null) {
-                                throw controller.getFailedOn();
-                            }
-                            return rpcCallback.get();
-                        }
-                    });
+            Map<byte[], GetVersionResponse> results;
+            try {
+                results =
+                        ht.coprocessorService(MetaDataService.class, tablekey, tablekey,
+                            new Batch.Call<MetaDataService, GetVersionResponse>() {
+                                @Override
+                                public GetVersionResponse call(MetaDataService instance)
+                                        throws IOException {
+                                    ServerRpcController controller = new ServerRpcController();
+                                    BlockingRpcCallback<GetVersionResponse> rpcCallback =
+                                            new BlockingRpcCallback<>();
+                                    GetVersionRequest.Builder builder =
+                                            GetVersionRequest.newBuilder();
+                                    builder.setClientVersion(
+                                        VersionUtil.encodeVersion(PHOENIX_MAJOR_VERSION,
+                                            PHOENIX_MINOR_VERSION, PHOENIX_PATCH_NUMBER));
+                                    instance.getVersion(controller, builder.build(), rpcCallback);
+                                    if (controller.getFailedOn() != null) {
+                                        throw controller.getFailedOn();
+                                    }
+                                    return rpcCallback.get();
+                                }
+                            });
+            } catch (Throwable t) {
+                throw ServerUtil.parseServerException(t);
+            }
             for (Map.Entry<byte[],GetVersionResponse> result : results.entrySet()) {
                 // This is the "phoenix.jar" is in-place, but server is out-of-sync with client case.
                 GetVersionResponse versionResponse = result.getValue();
                 long serverJarVersion = versionResponse.getVersion();
                 isTableNamespaceMappingEnabled |= MetaDataUtil.decodeTableNamespaceMappingEnabled(serverJarVersion);
 
-                if (!isCompatible(serverJarVersion)) {
-                    isIncompatible = true;
-                    HRegionLocation name = regionMap.get(result.getKey());
-                    buf.append(name);
-                    buf.append(';');
+                MetaDataUtil.ClientServerCompatibility compatibility = MetaDataUtil.areClientAndServerCompatible(serverJarVersion);
+                if (!compatibility.getIsCompatible()) {
+                    if (compatibility.getErrorCode() == SQLExceptionCode.OUTDATED_JARS.getErrorCode()) {
+                        HRegionLocation name = regionMap.get(result.getKey());
+                        errorMessage.append("Newer Phoenix clients can't communicate with older "
+                                + "Phoenix servers. Client version: "
+                                + MetaDataProtocol.CURRENT_CLIENT_VERSION
+                                + "; Server version: "
+                                + getServerVersion(serverJarVersion)
+                                + " The following servers require an updated "
+                                + QueryConstants.DEFAULT_COPROCESS_JAR_NAME
+                                + " to be put in the classpath of HBase: ");
+                        errorMessage.append(name);
+                        errorMessage.append(';');
+                    } else if (compatibility.getErrorCode() == SQLExceptionCode.INCOMPATIBLE_CLIENT_SERVER_JAR.getErrorCode()) {
+                        errorMessage.append("Major version of client is less than that of the server. Client version: "
+                                + MetaDataProtocol.CURRENT_CLIENT_VERSION
+                                + "; Server version: "
+                                + getServerVersion(serverJarVersion));
+                    }
                 }
                 hasIndexWALCodec &= hasIndexWALCodec(serverJarVersion);
                 if (minHBaseVersion > MetaDataUtil.decodeHBaseVersion(serverJarVersion)) {
@@ -1517,6 +1575,15 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                     systemCatalogTimestamp = systemCatalogTimestamp < versionResponse.getSystemCatalogTimestamp() ?
                       systemCatalogTimestamp: versionResponse.getSystemCatalogTimestamp();
                 }
+
+                if (compatibility.getErrorCode() != 0) {
+                    if (compatibility.getErrorCode() == SQLExceptionCode.OUTDATED_JARS.getErrorCode()) {
+                        errorMessage.setLength(errorMessage.length()-1);
+                        throw new SQLExceptionInfo.Builder(SQLExceptionCode.OUTDATED_JARS).setMessage(errorMessage.toString()).build().buildException();
+                    } else if (compatibility.getErrorCode() == SQLExceptionCode.INCOMPATIBLE_CLIENT_SERVER_JAR.getErrorCode()) {
+                        throw new SQLExceptionInfo.Builder(SQLExceptionCode.INCOMPATIBLE_CLIENT_SERVER_JAR).setMessage(errorMessage.toString()).build().buildException();
+                    }
+                }
             }
             if (isTableNamespaceMappingEnabled != SchemaUtil.isNamespaceMappingEnabled(PTableType.TABLE,
                     getProps())) { throw new SQLExceptionInfo.Builder(
@@ -1526,13 +1593,6 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                             + " is consistent on client and server.")
                             .build().buildException(); }
             lowestClusterHBaseVersion = minHBaseVersion;
-        } catch (SQLException | AccessDeniedException e) {
-            throw e;
-        } catch (Throwable t) {
-            // This is the case if the "phoenix.jar" is not on the classpath of HBase on the region server
-            throw new SQLExceptionInfo.Builder(SQLExceptionCode.INCOMPATIBLE_CLIENT_SERVER_JAR).setRootCause(t)
-            .setMessage("Ensure that " + QueryConstants.DEFAULT_COPROCESS_JAR_NAME + " is put on the classpath of HBase in every region server: " + t.getMessage())
-            .build().buildException();
         } finally {
             if (ht != null) {
                 try {
@@ -1542,13 +1602,16 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                 }
             }
         }
-        if (isIncompatible) {
-            buf.setLength(buf.length()-1);
-            throw new SQLExceptionInfo.Builder(SQLExceptionCode.OUTDATED_JARS).setMessage(buf.toString()).build().buildException();
-        }
+
         if (systemCatalogTimestamp < MIN_SYSTEM_TABLE_TIMESTAMP) {
             throw new UpgradeRequiredException(systemCatalogTimestamp);
         }
+    }
+
+    private String getServerVersion(long serverJarVersion) {
+        return (VersionUtil.decodeMajorVersion(MetaDataUtil.decodePhoenixVersion(serverJarVersion)) + "."
+                + VersionUtil.decodeMinorVersion(MetaDataUtil.decodePhoenixVersion(serverJarVersion)) + "."
+                + VersionUtil.decodePatchVersion(MetaDataUtil.decodePhoenixVersion(serverJarVersion)));
     }
 
     /**
@@ -2127,7 +2190,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
              * If the table was transitioned from non transactional to transactional, we need
              * to also transition the index tables.
              */
-            
+
             TableDescriptorBuilder tableDescriptorBuilder = TableDescriptorBuilder.newBuilder(tableDescriptor);
             if (nonTxToTx) {
                 updateDescriptorForTx(table, tableProps, tableDescriptorBuilder, Boolean.TRUE.toString(),
@@ -2379,7 +2442,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
         } else {
             tableDescriptorBuilder.setValue(PhoenixTransactionContext.READ_NON_TX_DATA, txValue);
         }
-        this.addCoprocessors(physicalTableName, tableDescriptorBuilder, tableType, tableProps);
+        this.addCoprocessors(physicalTableName, tableDescriptorBuilder, tableType, tableProps, null);
     }
 
     private Map<TableDescriptor, TableDescriptor> separateAndValidateProperties(PTable table,
@@ -2713,7 +2776,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
         return existingColumnFamilies(table);
     }
 
-    private HashSet<String> existingColumnFamilies(PTable table) {
+    public HashSet<String> existingColumnFamilies(PTable table) {
         List<PColumnFamily> cfs = table.getColumnFamilies();
         HashSet<String> cfNames = new HashSet<>(cfs.size());
         for (PColumnFamily cf : table.getColumnFamilies()) {
@@ -2722,7 +2785,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
         return cfNames;
     }
 
-    private static KeepDeletedCells getKeepDeletedCells(PTable table, TableDescriptor tableDesc,
+    public static KeepDeletedCells getKeepDeletedCells(PTable table, TableDescriptor tableDesc,
             KeepDeletedCells newKeepDeletedCells) throws SQLException {
         // If we're setting KEEP_DELETED_CELLS now, then use that value. Otherwise, use the empty column family value
         return (newKeepDeletedCells != null) ?
@@ -2730,7 +2793,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                 tableDesc.getColumnFamily(SchemaUtil.getEmptyColumnFamily(table)).getKeepDeletedCells();
     }
 
-    private static int getReplicationScope(PTable table, TableDescriptor tableDesc,
+    public static int getReplicationScope(PTable table, TableDescriptor tableDesc,
             Integer newReplicationScope) throws SQLException {
         // If we're setting replication scope now, then use that value. Otherwise, use the empty column family value
         return (newReplicationScope != null) ?
@@ -2738,7 +2801,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                 tableDesc.getColumnFamily(SchemaUtil.getEmptyColumnFamily(table)).getScope();
     }
 
-    private static int getTTL(PTable table, TableDescriptor tableDesc, Integer newTTL) throws SQLException {
+    public static int getTTL(PTable table, TableDescriptor tableDesc, Integer newTTL) throws SQLException {
         // If we're setting TTL now, then use that value. Otherwise, use empty column family value
         return (newTTL != null) ?
                 newTTL :
@@ -3043,12 +3106,12 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
         return String.format(ddl, props.getInt(LOG_SALT_BUCKETS_ATTRIB, QueryServicesOptions.DEFAULT_LOG_SALT_BUCKETS));
 
     }
-    
+
     // Available for testing
     protected String getChildLinkDDL() {
         return setSystemDDLProperties(QueryConstants.CREATE_CHILD_LINK_METADATA);
     }
-    
+
     protected String getMutexDDL() {
         return setSystemDDLProperties(QueryConstants.CREATE_MUTEX_METADTA);
     }
@@ -3238,7 +3301,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
             }
         }
     }
-    
+
     private boolean inspectIfAnyExceptionInChain(Throwable io, List<Class<? extends Exception>> ioList) {
         boolean exceptionToIgnore = false;
         for (Throwable t : Throwables.getCausalChain(io)) {
@@ -3350,12 +3413,12 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                 for (TableDescriptor table : localIndexTables) {
                     if (table.getValue(MetaDataUtil.PARENT_TABLE_KEY) == null
                             && table.getValue(MetaDataUtil.IS_LOCAL_INDEX_TABLE_PROP_NAME) != null) {
-                        
+
                         table=TableDescriptorBuilder.newBuilder(table).setValue(Bytes.toBytes(MetaDataUtil.PARENT_TABLE_KEY),
                                 Bytes.toBytes(MetaDataUtil.getLocalIndexUserTableName(table.getTableName().getNameAsString()))).build();
                         // Explicitly disable, modify and enable the table to ensure
                         // co-location of data and index regions. If we just modify the
-                        // table descriptor when online schema change enabled may reopen 
+                        // table descriptor when online schema change enabled may reopen
                         // the region in same region server instead of following data region.
                         admin.disableTable(table.getTableName());
                         admin.modifyTable(table);
@@ -3434,11 +3497,12 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                 conn.close();
             }
         }
-        // Add these columns one at a time, each with different timestamps so that if folks
-        // have
-        // run the upgrade code already for a snapshot, we'll still enter this block (and do
-        // the
-        // parts we haven't yet done).
+        // Add these columns one at a time so that if folks have run the upgrade code
+        // already for a snapshot, we'll still enter this block (and do the parts we
+        // haven't yet done).
+        // Add each column with different timestamp else the code assumes that the
+        // table is already modified at that timestamp resulting in not updating the
+        // second column with same timestamp
         if (currentServerSideTableTimeStamp < MetaDataProtocol.MIN_SYSTEM_TABLE_TIMESTAMP_4_6_0) {
             columnsToAdd = PhoenixDatabaseMetaData.IS_ROW_TIMESTAMP + " "
               + PBoolean.INSTANCE.getSqlTypeName();
@@ -3579,6 +3643,20 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                     PhoenixDatabaseMetaData.SYSTEM_CATALOG,
                     MIN_SYSTEM_TABLE_TIMESTAMP_4_15_0,
                     PhoenixDatabaseMetaData.VIEW_INDEX_ID_DATA_TYPE + " "
+                            + PInteger.INSTANCE.getSqlTypeName());
+        }
+        if (currentServerSideTableTimeStamp < MIN_SYSTEM_TABLE_TIMESTAMP_4_16_0) {
+            metaConnection = addColumnsIfNotExists(
+                    metaConnection,
+                    PhoenixDatabaseMetaData.SYSTEM_CATALOG,
+                    MIN_SYSTEM_TABLE_TIMESTAMP_4_16_0 - 1,
+                    PhoenixDatabaseMetaData.PHOENIX_TTL + " "
+                            + PInteger.INSTANCE.getSqlTypeName());
+            metaConnection = addColumnsIfNotExists(
+                    metaConnection,
+                    PhoenixDatabaseMetaData.SYSTEM_CATALOG,
+                    MIN_SYSTEM_TABLE_TIMESTAMP_4_16_0,
+                    PhoenixDatabaseMetaData.PHOENIX_TTL_HWM + " "
                             + PInteger.INSTANCE.getSqlTypeName());
         }
         return metaConnection;
@@ -3928,6 +4006,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
         props.setProperty(PhoenixRuntime.CURRENT_SCN_ATTRIB, Long.toString(timestamp));
         // Cannot go through DriverManager or you end up in an infinite loop because it'll call init again
         PhoenixConnection metaConnection = new PhoenixConnection(oldMetaConnection, this, props);
+        metaConnection.setAutoCommit(false);
         PTable sysCatalogPTable = metaConnection.getTable(new PTableKey(null, PhoenixDatabaseMetaData.SYSTEM_CATALOG_NAME));
         int numColumns = sysCatalogPTable.getColumns().size();
         try (PreparedStatement mutateTable = metaConnection.prepareStatement(MetaDataClient.MUTATE_TABLE)) {
@@ -3945,7 +4024,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
         metaConnection.rollback();
         PColumn column = new PColumnImpl(PNameFactory.newName("COLUMN_QUALIFIER"),
                 PNameFactory.newName(DEFAULT_COLUMN_FAMILY_NAME), PVarbinary.INSTANCE, null, null, true, numColumns,
-                SortOrder.ASC, null, null, false, null, false, false, 
+                SortOrder.ASC, null, null, false, null, false, false,
                 Bytes.toBytes("COLUMN_QUALIFIER"), timestamp);
         String upsertColumnMetadata = "UPSERT INTO " + SYSTEM_CATALOG_SCHEMA + ".\"" + SYSTEM_CATALOG_TABLE + "\"( " +
                 TENANT_ID + "," +
@@ -5169,7 +5248,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                         // iterate only up to whatever the current count is.
                         int numScanners = scannerQueue.size();
                         int renewed = 0;
-                        long start = System.currentTimeMillis();
+                        long start = EnvironmentEdgeManager.currentTimeMillis();
                         while (numScanners > 0) {
                             // It is guaranteed that this poll won't hang indefinitely because this is the
                             // only thread that removes items from the queue. Still adding a 1 ms timeout
@@ -5212,7 +5291,7 @@ public class ConnectionQueryServicesImpl extends DelegateQueryServices implement
                         }
                         if (renewed > 0) {
                             LOGGER.info("Renewed leases for " + renewed + " scanner/s in "
-                                    + (System.currentTimeMillis() - start) + " ms ");
+                                    + (EnvironmentEdgeManager.currentTimeMillis() - start) + " ms ");
                         }
                         connectionsQueue.offer(connRef);
                     }

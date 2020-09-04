@@ -618,6 +618,7 @@ public abstract class BaseTest {
         conf.setInt("ipc.server.read.threadpool.size", 2);
         conf.setInt("ipc.server.handler.threadpool.size", 2);
         conf.setInt("hbase.regionserver.hlog.syncer.count", 2);
+        conf.setInt("hbase.hfile.compaction.discharger.interval", 5000);
         conf.setInt("hbase.hlog.asyncer.number", 2);
         conf.setInt("hbase.assignment.zkevent.workers", 5);
         conf.setInt("hbase.assignment.threads.max", 5);
@@ -1846,6 +1847,8 @@ public abstract class BaseTest {
         HBaseTestingUtility util = getUtility();
         MiniHBaseCluster cluster = util.getHBaseCluster();
         HMaster master = cluster.getMaster();
+        //We don't want BalancerChore to undo our hard work
+        assertFalse("Balancer must be off", master.isBalancerOn());
         AssignmentManager am = master.getAssignmentManager();
         // No need to split on the first splitPoint since the end key of region boundaries are exclusive
         for (int i=1; i<splitPoints.size(); ++i) {

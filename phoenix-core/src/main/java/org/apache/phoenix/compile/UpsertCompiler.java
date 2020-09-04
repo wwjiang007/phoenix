@@ -175,8 +175,10 @@ public class UpsertCompiler {
         mutation.put(ptr, new RowMutationState(columnValues, columnValueSize, statement.getConnection().getStatementExecutionCounter(), rowTsColInfo, onDupKeyBytes));
     }
     
-    public static MutationState upsertSelect(StatementContext childContext, TableRef tableRef, RowProjector projector,
-            ResultIterator iterator, int[] columnIndexes, int[] pkSlotIndexes, boolean useServerTimestamp, boolean prefixSysColValues) throws SQLException {
+    public static MutationState upsertSelect(StatementContext childContext, TableRef tableRef,
+            RowProjector projector, ResultIterator iterator, int[] columnIndexes,
+            int[] pkSlotIndexes, boolean useServerTimestamp,
+            boolean prefixSysColValues) throws SQLException {
         PhoenixStatement statement = childContext.getStatement();
         PhoenixConnection connection = statement.getConnection();
         ConnectionQueryServices services = connection.getQueryServices();
@@ -233,22 +235,30 @@ public class UpsertCompiler {
                     Integer scale = rsScale == 0 ? null : rsScale;
                     // We are guaranteed that the two column will have compatible types,
                     // as we checked that before.
-                    if (!column.getDataType().isSizeCompatible(ptr, value, column.getDataType(), SortOrder.getDefault(), precision,
-                            scale, column.getMaxLength(), column.getScale())) { throw new SQLExceptionInfo.Builder(
-                            SQLExceptionCode.DATA_EXCEEDS_MAX_CAPACITY).setColumnName(column.getName().getString())
-                            .setMessage("value=" + column.getDataType().toStringLiteral(ptr, null)).build()
-                            .buildException(); }
+                    if (!column.getDataType().isSizeCompatible(ptr, value, column.getDataType(),
+                            SortOrder.getDefault(), precision,
+                            scale, column.getMaxLength(), column.getScale())) {
+                        throw new SQLExceptionInfo.Builder(
+                            SQLExceptionCode.DATA_EXCEEDS_MAX_CAPACITY).setColumnName(
+                                    column.getName().getString())
+                            .setMessage("value=" + column.getDataType()
+                                    .toStringLiteral(ptr, null)).build()
+                            .buildException();
+                    }
                     column.getDataType().coerceBytes(ptr, value, column.getDataType(), 
                             precision, scale, SortOrder.getDefault(), 
                             column.getMaxLength(), column.getScale(), column.getSortOrder(),
                             table.rowKeyOrderOptimizable());
                     values[j] = ByteUtil.copyKeyBytesIfNecessary(ptr);
                 }
-                setValues(values, pkSlotIndexes, columnIndexes, table, mutation, statement, useServerTimestamp, indexMaintainer, viewConstants, null, numSplColumns);
+                setValues(values, pkSlotIndexes, columnIndexes, table, mutation, statement,
+                        useServerTimestamp, indexMaintainer, viewConstants, null,
+                        numSplColumns);
                 rowCount++;
                 // Commit a batch if auto commit is true and we're at our batch size
                 if (autoFlush && rowCount % batchSize == 0) {
-                    MutationState state = new MutationState(tableRef, mutation, 0, maxSize, maxSizeBytes, connection);
+                    MutationState state = new MutationState(tableRef, mutation, 0,
+                            maxSize, maxSizeBytes, connection);
                     connection.getMutationState().join(state);
                     connection.getMutationState().send();
                     mutation.clear();
@@ -291,8 +301,8 @@ public class UpsertCompiler {
             StatementContext childContext = new StatementContext(statement, false);
             // Clone the row projector as it's not thread safe and would be used simultaneously by
             // multiple threads otherwise.
-            MutationState state = upsertSelect(childContext, tableRef, projector.cloneIfNecessary(), iterator, columnIndexes, pkSlotIndexes, useSeverTimestamp, false);
-            return state;
+            return upsertSelect(childContext, tableRef, projector.cloneIfNecessary(), iterator,
+                    columnIndexes, pkSlotIndexes, useSeverTimestamp, false);
         }
         
         public void setRowProjector(RowProjector projector) {
@@ -523,7 +533,8 @@ public class UpsertCompiler {
             for (i = posOffset; i < table.getColumns().size(); i++) {
                 PColumn column = table.getColumns().get(i);
                 if (!columnsBeingSet.get(i) && !column.isNullable() && column.getExpressionStr() == null) {
-                    throw new ConstraintViolationException(SchemaUtil.getColumnDisplayName(column) + " may not be null");
+                    throw new ConstraintViolationException(table.getName().getString() + "."
+                            + SchemaUtil.getColumnDisplayName(column) + " may not be null");
                 }
             }
         }
@@ -621,7 +632,8 @@ public class UpsertCompiler {
             for (int i = posOffset + nValuesToSet; i < table.getColumns().size(); i++) {
                 PColumn column = table.getColumns().get(i);
                 if (!column.isNullable() && column.getExpressionStr() == null) {
-                    throw new ConstraintViolationException(SchemaUtil.getColumnDisplayName(column) + " may not be null");
+                    throw new ConstraintViolationException(table.getName().getString() + "."
+                            + SchemaUtil.getColumnDisplayName(column) + " may not be null");
                 }
             }
         }

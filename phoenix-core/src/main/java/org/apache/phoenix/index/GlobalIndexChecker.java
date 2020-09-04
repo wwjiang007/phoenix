@@ -30,15 +30,12 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.CoprocessorEnvironment;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Delete;
-import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.Result;
@@ -65,6 +62,8 @@ import org.apache.phoenix.schema.types.PLong;
 import org.apache.phoenix.util.EnvironmentEdgeManager;
 import org.apache.phoenix.util.IndexUtil;
 import org.apache.phoenix.util.ServerUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 
@@ -90,7 +89,7 @@ import org.apache.phoenix.util.ServerUtil;
  *
  */
 public class GlobalIndexChecker implements RegionCoprocessor, RegionObserver {
-    private static final Log LOG = LogFactory.getLog(GlobalIndexChecker.class);
+    private static final Logger LOG = LoggerFactory.getLogger(GlobalIndexChecker.class);
     private GlobalIndexCheckerSource metricsSource;
     public enum RebuildReturnCode {
         NO_DATA_ROW(0),
@@ -113,10 +112,12 @@ public class GlobalIndexChecker implements RegionCoprocessor, RegionObserver {
      * and used to verify individual rows and rebuild them if they are not valid
      */
     private class GlobalIndexScanner implements RegionScanner {
-        RegionScanner scanner;
+        private RegionScanner scanner;
+        private RegionScanner deleteRowScanner;
         private long ageThreshold;
         private Scan scan;
         private Scan indexScan;
+        private Scan deleteRowScan;
         private Scan singleRowIndexScan;
         private Scan buildIndexScan = null;
         private Table dataHTable = null;
@@ -147,6 +148,15 @@ public class GlobalIndexChecker implements RegionCoprocessor, RegionObserver {
                     QueryServicesOptions.DEFAULT_GLOBAL_INDEX_ROW_AGE_THRESHOLD_TO_DELETE_MS);
             minTimestamp = scan.getTimeRange().getMin();
             maxTimestamp = scan.getTimeRange().getMax();
+            byte[] indexTableName = region.getRegionInfo().getTable().getName();
+            byte[] md = scan.getAttribute(PhoenixIndexCodec.INDEX_PROTO_MD);
+            List<IndexMaintainer> maintainers = IndexMaintainer.deserialize(md, true);
+            indexMaintainer = getIndexMaintainer(maintainers, indexTableName);
+            if (indexMaintainer == null) {
+                throw new DoNotRetryIOException(
+                        "repairIndexRows: IndexMaintainer is not included in scan attributes for " +
+                                region.getRegionInfo().getTable().getNameAsString());
+            }
         }
 
         @Override
@@ -243,12 +253,13 @@ public class GlobalIndexChecker implements RegionCoprocessor, RegionObserver {
 
         private void deleteRowIfAgedEnough(byte[] indexRowKey, List<Cell> row, long ts, boolean specific) throws IOException {
             if ((EnvironmentEdgeManager.currentTimeMillis() - ts) > ageThreshold) {
-                Delete del = new Delete(indexRowKey, ts);
+                Delete del;
                 if (specific) {
-                    // We are deleting a specific version of a row so the flowing loop is for that
-                    for (Cell cell : row) {
-                        del.addColumn(CellUtil.cloneFamily(cell), CellUtil.cloneQualifier(cell), cell.getTimestamp());
-                    }
+                    del = indexMaintainer.buildRowDeleteMutation(indexRowKey,
+                            IndexMaintainer.DeleteType.SINGLE_VERSION, ts);
+                } else {
+                    del = indexMaintainer.buildRowDeleteMutation(indexRowKey,
+                            IndexMaintainer.DeleteType.ALL_VERSIONS, ts);
                 }
                 Mutation[] mutations = new Mutation[]{del};
                 region.batchMutate(mutations);
@@ -260,24 +271,12 @@ public class GlobalIndexChecker implements RegionCoprocessor, RegionObserver {
             if (buildIndexScan == null) {
                 buildIndexScan = new Scan();
                 indexScan = new Scan(scan);
+                deleteRowScan = new Scan();
                 singleRowIndexScan = new Scan(scan);
                 byte[] dataTableName = scan.getAttribute(PHYSICAL_DATA_TABLE_NAME);
-                byte[] indexTableName = region.getRegionInfo().getTable().getName();
                 dataHTable = ServerUtil.ConnectionFactory.getConnection(ServerUtil.ConnectionType.INDEX_WRITER_CONNECTION,
                         env).getTable(TableName.valueOf(dataTableName));
-                if (indexMaintainer == null) {
-                    byte[] md = scan.getAttribute(PhoenixIndexCodec.INDEX_PROTO_MD);
-                    List<IndexMaintainer> maintainers = IndexMaintainer.deserialize(md, true);
-                    indexMaintainer = getIndexMaintainer(maintainers, indexTableName);
-                }
-                if (indexMaintainer == null) {
-                    throw new DoNotRetryIOException(
-                            "repairIndexRows: IndexMaintainer is not included in scan attributes for " +
-                                    region.getRegionInfo().getTable().getNameAsString());
-                }
-                if (viewConstants == null) {
-                    viewConstants = IndexUtil.deserializeViewConstantsFromScan(scan);
-                }
+                viewConstants = IndexUtil.deserializeViewConstantsFromScan(scan);
                 // The following attributes are set to instruct UngroupedAggregateRegionObserver to do partial index rebuild
                 // i.e., rebuild a subset of index rows.
                 buildIndexScan.setAttribute(BaseScannerRegionObserver.UNGROUPED_AGG, TRUE_BYTES);
@@ -411,23 +410,48 @@ public class GlobalIndexChecker implements RegionCoprocessor, RegionObserver {
                             emptyCQ, 0, emptyCQ.length) == 0;
         }
 
-        private boolean verifyRow(byte[] rowKey) throws IOException {
-            LOG.warn("Scan " + scan + " did not return the empty column for " + region.getRegionInfo().getTable().getNameAsString());
-            Get get = new Get(rowKey);
-            get.setTimeRange(minTimestamp, maxTimestamp);
-            get.addColumn(emptyCF, emptyCQ);
-            Result result = region.get(get);
-            if (result.isEmpty()) {
-                throw new DoNotRetryIOException("The empty column does not exist in a row in " + region.getRegionInfo().getTable().getNameAsString());
+        /**
+         *  An index row is composed of cells with the same timestamp. However, if there are multiple versions of an
+         *  index row, HBase can return an index row with cells from multiple versions, and thus it can return cells
+         *  with different timestamps. This happens if the version of the row we are reading does not have a value
+         *  (i.e., effectively has null value) for a column whereas an older version has a value for the column.
+         *  In this case, we need to remove the older cells for correctness.
+         */
+        private void removeOlderCells(List<Cell> cellList) {
+            Iterator<Cell> cellIterator = cellList.iterator();
+            if (!cellIterator.hasNext()) {
+                return;
             }
-            if (Bytes.compareTo(result.getValue(emptyCF, emptyCQ), 0, VERIFIED_BYTES.length,
-                    VERIFIED_BYTES, 0, VERIFIED_BYTES.length) != 0) {
-                return false;
+            Cell cell = cellIterator.next();
+            long maxTs = cell.getTimestamp();
+            long ts;
+            boolean allTheSame = true;
+            while (cellIterator.hasNext()) {
+                cell = cellIterator.next();
+                ts = cell.getTimestamp();
+                if (ts != maxTs) {
+                    if (ts > maxTs) {
+                        maxTs = ts;
+                    }
+                    allTheSame = false;
+                }
             }
-            return true;
+            if (allTheSame) {
+                return;
+            }
+            cellIterator = cellList.iterator();
+            while (cellIterator.hasNext()) {
+                cell = cellIterator.next();
+                if (cell.getTimestamp() != maxTs) {
+                    cellIterator.remove();
+                }
+            }
         }
 
         private boolean verifyRowAndRemoveEmptyColumn(List<Cell> cellList) throws IOException {
+            if (!indexMaintainer.isImmutableRows()) {
+                removeOlderCells(cellList);
+            }
             long cellListSize = cellList.size();
             Cell cell = null;
             if (cellListSize == 0) {
@@ -449,8 +473,9 @@ public class GlobalIndexChecker implements RegionCoprocessor, RegionObserver {
                     return true;
                 }
             }
-            byte[] rowKey = CellUtil.cloneRow(cell);
-            return verifyRow(rowKey);
+            // This index row does not have an empty column cell. It must be removed by compaction. This row will
+            // be treated as unverified so that it can be repaired
+            return false;
         }
 
         private long getMaxTimestamp(List<Cell> cellList) {
@@ -473,6 +498,7 @@ public class GlobalIndexChecker implements RegionCoprocessor, RegionObserver {
          * @throws IOException
          */
         private boolean verifyRowAndRepairIfNecessary(List<Cell> cellList) throws IOException {
+            metricsSource.incrementIndexInspections();
             Cell cell = cellList.get(0);
             if (verifyRowAndRemoveEmptyColumn(cellList)) {
                 return true;
@@ -480,7 +506,7 @@ public class GlobalIndexChecker implements RegionCoprocessor, RegionObserver {
                 long repairStart = EnvironmentEdgeManager.currentTimeMillis();
 
                 byte[] rowKey = CellUtil.cloneRow(cell);
-                long ts = getMaxTimestamp(cellList);
+                long ts = cellList.get(0).getTimestamp();
                 cellList.clear();
 
                 try {

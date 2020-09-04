@@ -20,6 +20,9 @@ package org.apache.phoenix.schema;
 import static com.google.common.collect.Sets.newLinkedHashSet;
 import static com.google.common.collect.Sets.newLinkedHashSetWithExpectedSize;
 import static org.apache.phoenix.coprocessor.BaseScannerRegionObserver.RUN_UPDATE_STATS_ASYNC_ATTRIB;
+import static org.apache.phoenix.coprocessor.MetaDataProtocol.PHOENIX_MAJOR_VERSION;
+import static org.apache.phoenix.coprocessor.MetaDataProtocol.PHOENIX_MINOR_VERSION;
+import static org.apache.phoenix.coprocessor.MetaDataProtocol.PHOENIX_PATCH_NUMBER;
 import static org.apache.phoenix.coprocessor.tasks.IndexRebuildTask.INDEX_NAME;
 import static org.apache.phoenix.coprocessor.tasks.IndexRebuildTask.REBUILD_ALL;
 import static org.apache.phoenix.exception.SQLExceptionCode.INSUFFICIENT_MULTI_TENANT_COLUMNS;
@@ -78,7 +81,6 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.STORE_NULLS;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYNC_INDEX_CREATED_DATE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CATALOG_SCHEMA;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CATALOG_TABLE;
-import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_CHILD_LINK_TABLE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.SYSTEM_FUNCTION_TABLE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_NAME;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.TABLE_SCHEM;
@@ -94,6 +96,10 @@ import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_CONSTANT;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_STATEMENT;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_TYPE;
 import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.VIEW_INDEX_ID_DATA_TYPE;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.PHOENIX_TTL;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.PHOENIX_TTL_HWM;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.PHOENIX_TTL_NOT_DEFINED;
+import static org.apache.phoenix.jdbc.PhoenixDatabaseMetaData.MIN_PHOENIX_TTL_HWM;
 import static org.apache.phoenix.query.QueryConstants.BASE_TABLE_BASE_COLUMN_COUNT;
 import static org.apache.phoenix.query.QueryConstants.DEFAULT_COLUMN_FAMILY;
 import static org.apache.phoenix.query.QueryConstants.ENCODED_CQ_COUNTER_INITIAL_VALUE;
@@ -118,6 +124,7 @@ import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Timestamp;
 import java.sql.Types;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collection;
@@ -132,8 +139,9 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Properties;
 import java.util.Set;
-
-import com.google.gson.JsonObject;
+import java.util.HashSet;
+import org.apache.hadoop.conf.Configuration;
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.ClusterConnection;
@@ -144,6 +152,7 @@ import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.TableDescriptor;
+import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.security.AccessDeniedException;
 import org.apache.hadoop.hbase.security.access.AccessControlClient;
 import org.apache.hadoop.hbase.security.access.Permission;
@@ -164,7 +173,10 @@ import org.apache.phoenix.coprocessor.MetaDataProtocol;
 import org.apache.phoenix.coprocessor.MetaDataProtocol.MetaDataMutationResult;
 import org.apache.phoenix.coprocessor.MetaDataProtocol.MutationCode;
 import org.apache.phoenix.coprocessor.MetaDataProtocol.SharedTableState;
+import org.apache.phoenix.hbase.index.util.VersionUtil;
+import org.apache.phoenix.schema.stats.GuidePostsInfo;
 import org.apache.phoenix.util.ViewUtil;
+import org.apache.phoenix.util.JacksonUtil;
 import org.apache.phoenix.exception.SQLExceptionCode;
 import org.apache.phoenix.exception.SQLExceptionInfo;
 import org.apache.phoenix.execute.MutationState;
@@ -219,6 +231,7 @@ import org.apache.phoenix.schema.PTable.LinkType;
 import org.apache.phoenix.schema.PTable.QualifierEncodingScheme;
 import org.apache.phoenix.schema.PTable.QualifierEncodingScheme.QualifierOutOfRangeException;
 import org.apache.phoenix.schema.PTable.ViewType;
+import org.apache.phoenix.schema.stats.GuidePostsInfo;
 import org.apache.phoenix.schema.stats.GuidePostsKey;
 import org.apache.phoenix.schema.stats.StatisticsUtil;
 import org.apache.phoenix.schema.task.Task;
@@ -310,8 +323,10 @@ public class MetaDataClient {
                     IMMUTABLE_STORAGE_SCHEME + "," +
                     ENCODING_SCHEME + "," +
                     USE_STATS_FOR_PARALLELIZATION +"," +
-                    VIEW_INDEX_ID_DATA_TYPE +
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    VIEW_INDEX_ID_DATA_TYPE +"," +
+                    PHOENIX_TTL +"," +
+                    PHOENIX_TTL_HWM +
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     private static final String CREATE_SCHEMA = "UPSERT INTO " + SYSTEM_CATALOG_SCHEMA + ".\"" + SYSTEM_CATALOG_TABLE
             + "\"( " + TABLE_SCHEM + "," + TABLE_NAME + ") VALUES (?,?)";
@@ -531,7 +546,7 @@ public class MetaDataClient {
 
     /**
      * Update the cache with the latest as of the connection scn.
-     * @param functioNames
+     * @param functionNames
      * @return the timestamp from the server, negative if the function was added to the cache and positive otherwise
      * @throws SQLException
      */
@@ -623,7 +638,7 @@ public class MetaDataClient {
                     tableRef = connection.getTableRef(new PTableKey(tenantId, fullTableName));
                     table = tableRef.getTable();
                     return new MetaDataMutationResult(MutationCode.TABLE_ALREADY_EXISTS,
-                            QueryConstants.UNSET_TIMESTAMP, table);
+                            tableRef.getResolvedTimeStamp(), table);
                 } catch (TableNotFoundException e) {
                     // reset the result as we looked up the parent view 
                     return new MetaDataMutationResult(MutationCode.TABLE_NOT_FOUND,
@@ -722,14 +737,46 @@ public class MetaDataClient {
     // 1. table is a system table that does not have a ROW_TIMESTAMP column OR
     // 2. table was already resolved as of that timestamp OR
     // 3. table does not have a ROW_TIMESTAMP column and age is less then UPDATE_CACHE_FREQUENCY
+    // 3a. Get the effective UPDATE_CACHE_FREQUENCY for checking the age in the following precedence order:
+    // Table-level property > Connection-level property > Default value.
     private boolean avoidRpcToGetTable(boolean alwaysHitServer, Long resolvedTimestamp,
             boolean systemTable, PTable table, PTableRef tableRef, long tableResolvedTimestamp) {
-        return table != null && !alwaysHitServer &&
-                (systemTable && table.getRowTimestampColPos() == -1 ||
-                        resolvedTimestamp == tableResolvedTimestamp ||
-                        (table.getRowTimestampColPos() == -1 &&
-                                connection.getMetaDataCache().getAge(tableRef) <
-                                        table.getUpdateCacheFrequency()));
+        if (table != null && !alwaysHitServer) {
+            if (systemTable && table.getRowTimestampColPos() == -1 ||
+                    resolvedTimestamp == tableResolvedTimestamp) {
+                return true;
+            }
+
+            final long effectiveUpdateCacheFreq;
+            final String ucfInfoForLogging; // Only used for logging purposes
+
+            // What if the table is created with UPDATE_CACHE_FREQUENCY explicitly set to ALWAYS?
+            // i.e. explicitly set to 0. We should ideally be checking for something like
+            // hasUpdateCacheFrequency().
+            if (table.getUpdateCacheFrequency() != 0L) {
+                effectiveUpdateCacheFreq = table.getUpdateCacheFrequency();
+                ucfInfoForLogging = "table-level";
+            } else {
+                effectiveUpdateCacheFreq =
+                        (Long) ConnectionProperty.UPDATE_CACHE_FREQUENCY.getValue(
+                                connection.getQueryServices().getProps().get(
+                                        QueryServices.DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB));
+                ucfInfoForLogging = connection.getQueryServices().getProps().get(
+                        QueryServices.DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB) != null ?
+                        "connection-level" : "default";
+            }
+
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Using " + ucfInfoForLogging + " Update Cache Frequency (value = " +
+                        effectiveUpdateCacheFreq + "ms) for " + table.getName() +
+                        (table.getTenantId() != null ? ", Tenant ID: " + table.getTenantId() : ""));
+            }
+
+            return (table.getRowTimestampColPos() == -1 &&
+                    connection.getMetaDataCache().getAge(tableRef) <
+                            effectiveUpdateCacheFreq);
+        }
+        return false;
     }
 
     public MetaDataMutationResult updateCache(String schemaName) throws SQLException {
@@ -863,8 +910,8 @@ public class MetaDataClient {
             if (!alwaysAddAncestorColumnsAndIndexes && !result.wasUpdated() && !parentResult.wasUpdated()) {
                 return false;
             }
-            PTable resolvedTable = ViewUtil.addDerivedColumnsAndIndexesFromParent(connection, table, parentTable);
-            result.setTable(resolvedTable);
+            result.setTable(ViewUtil.addDerivedColumnsAndIndexesFromParent(
+                    connection, table, parentTable));
             return true;
         }
         return false;
@@ -998,8 +1045,9 @@ public class MetaDataClient {
         populatePropertyMaps(statement.getProps(), tableProps, commonFamilyProps, statement.getTableType());
 
         boolean isAppendOnlySchema = false;
-        long updateCacheFrequency = connection.getQueryServices().getProps().getLong(
-            QueryServices.DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB, QueryServicesOptions.DEFAULT_UPDATE_CACHE_FREQUENCY);
+        long updateCacheFrequency = (Long) ConnectionProperty.UPDATE_CACHE_FREQUENCY.getValue(
+                connection.getQueryServices().getProps().get(
+                        QueryServices.DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB));
         Long updateCacheFrequencyProp = (Long) TableProperty.UPDATE_CACHE_FREQUENCY.getValue(tableProps);
         if (parent==null) {
 	        Boolean appendOnlySchemaProp = (Boolean) TableProperty.APPEND_ONLY_SCHEMA.getValue(tableProps);
@@ -1649,6 +1697,41 @@ public class MetaDataClient {
                 }
             }
 
+            Configuration config = connection.getQueryServices().getConfiguration();
+            long threshold = Long.parseLong(config.get(QueryServices.CLIENT_INDEX_ASYNC_THRESHOLD));
+
+            if (threshold > 0 && !statement.isAsync()) {
+                Set<String> columnFamilies = new HashSet<>();
+                for (ColumnDef column : columnDefs){
+                    try {
+                        String columnFamily = IndexUtil
+                                .getDataColumnFamilyName(column.getColumnDefName().getColumnName());
+                        columnFamilies.add(!columnFamily.equals("") ? columnFamily
+                                : dataTable.getDefaultFamilyName()!= null ?
+                                        dataTable.getDefaultFamilyName().toString()
+                                        : QueryConstants.DEFAULT_COLUMN_FAMILY);
+                    } catch (Exception ignored){
+                        ; // We ignore any exception during this phase
+                    }
+                }
+                long estimatedBytes = 0;
+                for (String colFamily : columnFamilies) {
+                    GuidePostsInfo gps = connection.getQueryServices().getTableStats(
+                            new GuidePostsKey(Bytes.toBytes(tableRef.getTable().toString()),
+                                    Bytes.toBytes(colFamily)));
+                    long[] byteCounts = gps.getByteCounts();
+                    for (long byteCount : byteCounts) {
+                        estimatedBytes += byteCount;
+                    }
+
+                    if (threshold < estimatedBytes) {
+                        throw new SQLExceptionInfo
+                                .Builder(SQLExceptionCode.ABOVE_INDEX_NON_ASYNC_THRESHOLD)
+                                .build().buildException();
+                    }
+                }
+            }
+
             // Set DEFAULT_COLUMN_FAMILY_NAME of index to match data table
             // We need this in the props so that the correct column family is created
             if (dataTable.getDefaultFamilyName() != null && dataTable.getType() != PTableType.VIEW && !allocateIndexId) {
@@ -1973,10 +2056,46 @@ public class MetaDataClient {
             int baseTableColumnCount =
                     tableType == PTableType.VIEW ? parent.getColumns().size()
                             : QueryConstants.BASE_TABLE_BASE_COLUMN_COUNT;
+
+            Long phoenixTTL = PHOENIX_TTL_NOT_DEFINED;
+            Long phoenixTTLHighWaterMark = MIN_PHOENIX_TTL_HWM;
+            Long phoenixTTLProp = (Long) TableProperty.PHOENIX_TTL.getValue(tableProps);;
+            // Validate VIEW_TTL prop value if set
+            if (phoenixTTLProp != null) {
+                if (phoenixTTLProp < 0) {
+                    throw new SQLExceptionInfo.Builder(SQLExceptionCode.ILLEGAL_DATA)
+                            .setMessage(String.format("view = %s, PHOENIX_TTL value should be > 0", tableName ))
+                            .build()
+                            .buildException();
+                }
+
+                if (tableType == VIEW  && parentPhysicalName != null) {
+                    TableDescriptor desc = connection.getQueryServices().getTableDescriptor(parentPhysicalName.getBytes());
+                    if (desc != null) {
+                        Integer tableTTLProp = desc.getColumnFamily(SchemaUtil.getEmptyColumnFamily(parent)).getTimeToLive();
+                        if ((tableTTLProp != null) && (tableTTLProp != HConstants.FOREVER)) {
+                            throw new SQLExceptionInfo.Builder(SQLExceptionCode.CANNOT_SET_OR_ALTER_PHOENIX_TTL_FOR_TABLE_WITH_TTL)
+                                    .setMessage(String.format("table = %s, view = %s", parentPhysicalName, tableName ))
+                                    .build()
+                                    .buildException();
+                        }
+                    }
+                }
+
+                if (tableType != VIEW) {
+                    throw new SQLExceptionInfo.Builder(SQLExceptionCode.PHOENIX_TTL_SUPPORTED_FOR_VIEWS_ONLY)
+                            .setSchemaName(schemaName)
+                            .setTableName(tableName)
+                            .build()
+                            .buildException();
+                }
+            }
+
             if (parent != null && tableType == PTableType.INDEX) {
                 timestamp = TransactionUtil.getTableTimestamp(connection, transactionProvider != null, transactionProvider);
                 isImmutableRows = parent.isImmutableRows();
                 isAppendOnlySchema = parent.isAppendOnlySchema();
+                phoenixTTL = parent.getPhoenixTTL();
 
                 // Index on view
                 // TODO: Can we support a multi-tenant index directly on a multi-tenant
@@ -2098,8 +2217,9 @@ public class MetaDataClient {
             if (disableWALProp != null) {
                 disableWAL = disableWALProp;
             }
-            long updateCacheFrequency = connection.getQueryServices().getProps().getLong(
-                QueryServices.DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB, QueryServicesOptions.DEFAULT_UPDATE_CACHE_FREQUENCY);
+            long updateCacheFrequency = (Long) ConnectionProperty.UPDATE_CACHE_FREQUENCY.getValue(
+                    connection.getQueryServices().getProps().get(
+                            QueryServices.DEFAULT_UPDATE_CACHE_FREQUENCY_ATRRIB));
             if (tableType == PTableType.INDEX && parent != null) {
                 updateCacheFrequency = parent.getUpdateCacheFrequency();
             }
@@ -2107,6 +2227,7 @@ public class MetaDataClient {
             if (tableType != PTableType.INDEX && updateCacheFrequencyProp != null) {
                 updateCacheFrequency = updateCacheFrequencyProp;
             }
+
             String autoPartitionSeq = (String) TableProperty.AUTO_PARTITION_SEQ.getValue(tableProps);
             Long guidePostsWidth = (Long) TableProperty.GUIDE_POSTS_WIDTH.getValue(tableProps);
 
@@ -2287,6 +2408,9 @@ public class MetaDataClient {
                         // set to the parent value if the property is not set on the view
                         updateCacheFrequency = parent.getUpdateCacheFrequency();
                     }
+
+                    phoenixTTL = phoenixTTLProp == null ? parent.getPhoenixTTL() : phoenixTTLProp;
+
                     disableWAL = (disableWALProp == null ? parent.isWALDisabled() : disableWALProp);
                     defaultFamilyName = parent.getDefaultFamilyName() == null ? null : parent.getDefaultFamilyName().getString();
                     // TODO PHOENIX-4766 Add an options to stop sending parent metadata when creating views
@@ -2645,6 +2769,8 @@ public class MetaDataClient {
                         .setIndexes(Collections.emptyList())
                         .setPhysicalNames(ImmutableList.of())
                         .setColumns(columns.values())
+                        .setPhoenixTTL(PHOENIX_TTL_NOT_DEFINED)
+                        .setPhoenixTTLHighWaterMark(MIN_PHOENIX_TTL_HWM)
                         .build();
                 connection.addTable(table, MetaDataProtocol.MIN_TABLE_TIMESTAMP);
             }
@@ -2834,6 +2960,15 @@ public class MetaDataClient {
                 tableUpsert.setBoolean(28, useStatsForParallelizationProp);
             }
             tableUpsert.setInt(29, viewIndexIdType.getSqlType());
+            if (phoenixTTL == null || phoenixTTL == PHOENIX_TTL_NOT_DEFINED) {
+                tableUpsert.setNull(30, Types.BIGINT);
+                tableUpsert.setNull(31, Types.BIGINT);
+            }
+            else {
+                tableUpsert.setLong(30, phoenixTTL);
+                tableUpsert.setLong(31, phoenixTTLHighWaterMark);
+            }
+
             tableUpsert.execute();
 
             if (asyncCreatedDate != null) {
@@ -2867,142 +3002,184 @@ public class MetaDataClient {
                 splits = SchemaUtil.processSplits(splits, pkColumns, saltBucketNum, connection.getQueryServices().getProps().getBoolean(
                         QueryServices.FORCE_ROW_KEY_ORDER_ATTRIB, QueryServicesOptions.DEFAULT_FORCE_ROW_KEY_ORDER));
             }
-            MetaDataMutationResult result = connection.getQueryServices().createTable(
-                    tableMetaData,
-                    viewType == ViewType.MAPPED || allocateIndexId ? physicalNames.get(0).getBytes() : null,
-                    tableType, tableProps, familyPropList, splits, isNamespaceMapped, allocateIndexId,
-                    UpgradeUtil.isNoUpgradeSet(connection.getClientInfo()), parent);
+
+			// Modularized this code for unit testing
+            MetaDataMutationResult result = connection.getQueryServices().createTable(tableMetaData
+                ,viewType == ViewType.MAPPED || allocateIndexId ? physicalNames.get(0).getBytes()
+                : null, tableType, tableProps, familyPropList, splits, isNamespaceMapped,
+                allocateIndexId, UpgradeUtil.isNoUpgradeSet(connection.getClientInfo()), parent);
             MutationCode code = result.getMutationCode();
-            switch(code) {
+            if (code != MutationCode.TABLE_NOT_FOUND) {
+                boolean tableAlreadyExists = handleCreateTableMutationCode(result, code, statement,
+                        schemaName, tableName, parent);
+                if(tableAlreadyExists) {
+                    return null;
+                }
+            }
+            // If the parent table of the view has the auto partition sequence name attribute,
+            // set the view statement and relevant partition column attributes correctly
+            if (parent!=null && parent.getAutoPartitionSeqName()!=null) {
+                final PColumn autoPartitionCol = parent.getPKColumns().get(MetaDataUtil
+                        .getAutoPartitionColIndex(parent));
+                final Long autoPartitionNum = Long.valueOf(result.getAutoPartitionNum());
+                columns.put(autoPartitionCol, new DelegateColumn(autoPartitionCol) {
+                    @Override
+                    public byte[] getViewConstant() {
+                        PDataType dataType = autoPartitionCol.getDataType();
+                        Object val = dataType.toObject(autoPartitionNum, PLong.INSTANCE);
+                        byte[] bytes = new byte [dataType.getByteSize() + 1];
+                        dataType.toBytes(val, bytes, 0);
+                        return bytes;
+                    }
+                    @Override
+                    public boolean isViewReferenced() {
+                        return true;
+                    }
+                });
+                String viewPartitionClause = QueryUtil.getViewPartitionClause(MetaDataUtil
+                        .getAutoPartitionColumnName(parent), autoPartitionNum);
+                if (viewStatement!=null) {
+                    viewStatement = viewStatement + " AND " + viewPartitionClause;
+                }
+                else {
+                    viewStatement = QueryUtil.getViewStatement(parent.getSchemaName().getString(),
+                            parent.getTableName().getString(), viewPartitionClause);
+                }
+            }
+            PName newSchemaName = PNameFactory.newName(schemaName);
+            /*
+             * It doesn't hurt for the PTable of views to have the cqCounter. However, views always
+             * rely on the parent table's counter to dole out encoded column qualifiers. So setting
+             * the counter as NULL_COUNTER for extra safety.
+             */
+            EncodedCQCounter cqCounterToBe = tableType == PTableType.VIEW ? NULL_COUNTER :
+                    cqCounter;
+            PTable table = new PTableImpl.Builder()
+                    .setType(tableType)
+                    .setState(indexState)
+                    .setTimeStamp(timestamp != null ? timestamp : result.getMutationTime())
+                    .setIndexDisableTimestamp(0L)
+                    .setSequenceNumber(PTable.INITIAL_SEQ_NUM)
+                    .setImmutableRows(isImmutableRows)
+                    .setViewStatement(viewStatement)
+                    .setDisableWAL(Boolean.TRUE.equals(disableWAL))
+                    .setMultiTenant(multiTenant)
+                    .setStoreNulls(storeNulls)
+                    .setViewType(viewType)
+                    .setViewIndexIdType(viewIndexIdType)
+                    .setViewIndexId(result.getViewIndexId())
+                    .setIndexType(indexType)
+                    .setTransactionProvider(transactionProvider)
+                    .setUpdateCacheFrequency(updateCacheFrequency)
+                    .setNamespaceMapped(isNamespaceMapped)
+                    .setAutoPartitionSeqName(autoPartitionSeq)
+                    .setAppendOnlySchema(isAppendOnlySchema)
+                    .setImmutableStorageScheme(immutableStorageScheme == null ?
+                            ImmutableStorageScheme.ONE_CELL_PER_COLUMN : immutableStorageScheme)
+                    .setQualifierEncodingScheme(encodingScheme == null ?
+                            QualifierEncodingScheme.NON_ENCODED_QUALIFIERS : encodingScheme)
+                    .setBaseColumnCount(baseTableColumnCount)
+                    .setEncodedCQCounter(cqCounterToBe)
+                    .setUseStatsForParallelization(useStatsForParallelizationProp)
+                    .setExcludedColumns(ImmutableList.of())
+                    .setTenantId(tenantId)
+                    .setSchemaName(newSchemaName)
+                    .setTableName(PNameFactory.newName(tableName))
+                    .setPkName(pkName == null ? null : PNameFactory.newName(pkName))
+                    .setDefaultFamilyName(defaultFamilyName == null ?
+                            null : PNameFactory.newName(defaultFamilyName))
+                    .setRowKeyOrderOptimizable(rowKeyOrderOptimizable)
+                    .setBucketNum(saltBucketNum)
+                    .setIndexes(Collections.emptyList())
+                    .setParentSchemaName((parent == null) ? null : parent.getSchemaName())
+                    .setParentTableName((parent == null) ? null : parent.getTableName())
+                    .setPhysicalNames(physicalNames == null ?
+                            ImmutableList.of() : ImmutableList.copyOf(physicalNames))
+                    .setColumns(columns.values())
+                    .setPhoenixTTL(phoenixTTL == null ? PHOENIX_TTL_NOT_DEFINED : phoenixTTL)
+                    .setPhoenixTTLHighWaterMark(phoenixTTLHighWaterMark == null ? MIN_PHOENIX_TTL_HWM :
+                            phoenixTTLHighWaterMark)
+                    .setViewModifiedUpdateCacheFrequency(tableType ==  PTableType.VIEW &&
+                            parent != null &&
+                            parent.getUpdateCacheFrequency() != updateCacheFrequency)
+                    .setViewModifiedUseStatsForParallelization(tableType ==  PTableType.VIEW &&
+                            parent != null &&
+                            parent.useStatsForParallelization()
+                                    != useStatsForParallelizationProp)
+                    .setViewModifiedPhoenixTTL(tableType ==  PTableType.VIEW &&
+                            parent != null && phoenixTTL != null &&
+                            parent.getPhoenixTTL() != phoenixTTL)
+                    .build();
+            result = new MetaDataMutationResult(code, result.getMutationTime(), table, true);
+            addTableToCache(result);
+            return table;
+        } finally {
+            connection.setAutoCommit(wasAutoCommit);
+            deleteMutexCells(parentPhysicalSchemaName, parentPhysicalTableName,
+                    acquiredColumnMutexSet);
+        }
+    }
+
+    /* This method handles mutation codes sent by phoenix server, except for TABLE_NOT_FOUND which
+    * is considered to be a success code. If TABLE_ALREADY_EXISTS in hbase, we don't need to add
+    * it in ConnectionQueryServices and we return result as true. However if code is
+    * NEWER_TABLE_FOUND and it does not exists in statement then we return false because we need to
+    * add it ConnectionQueryServices. For other mutation codes it throws related SQLException.
+    * If server is throwing new mutation code which is not being handled by client then it throws
+    * SQLException stating the server side Mutation code.
+    */
+    @VisibleForTesting
+    public boolean handleCreateTableMutationCode(MetaDataMutationResult result, MutationCode code,
+                 CreateTableStatement statement, String schemaName, String tableName,
+                 PTable parent) throws SQLException {
+        switch(code) {
             case TABLE_ALREADY_EXISTS:
-                if (result.getTable() != null) { // Can happen for transactional table that already exists as HBase table
+                if(result.getTable() != null) {
                     addTableToCache(result);
                 }
-                if (!statement.ifNotExists()) {
+                if(!statement.ifNotExists()) {
                     throw new TableAlreadyExistsException(schemaName, tableName, result.getTable());
                 }
-                return null;
+                return true;
             case NEWER_TABLE_FOUND:
                 // Add table to ConnectionQueryServices so it's cached, but don't add
                 // it to this connection as we can't see it.
                 if (!statement.ifNotExists()) {
-                    throw new NewerTableAlreadyExistsException(schemaName, tableName, result.getTable());
+                    throw new NewerTableAlreadyExistsException(schemaName, tableName,
+                            result.getTable());
                 }
+                return false;
             case UNALLOWED_TABLE_MUTATION:
-                throw new SQLExceptionInfo.Builder(SQLExceptionCode.CANNOT_MUTATE_TABLE)
-                    .setSchemaName(schemaName).setTableName(tableName).build().buildException();
+                throwsSQLExceptionUtil("CANNOT_MUTATE_TABLE",schemaName,tableName);
             case CONCURRENT_TABLE_MUTATION:
                 addTableToCache(result);
                 throw new ConcurrentTableMutationException(schemaName, tableName);
             case AUTO_PARTITION_SEQUENCE_NOT_FOUND:
                 throw new SQLExceptionInfo.Builder(SQLExceptionCode.AUTO_PARTITION_SEQUENCE_UNDEFINED)
-                .setSchemaName(schemaName).setTableName(tableName).build().buildException();
+                       .setSchemaName(schemaName).setTableName(tableName).build().buildException();
             case CANNOT_COERCE_AUTO_PARTITION_ID:
-                throw new SQLExceptionInfo.Builder(SQLExceptionCode.CANNOT_COERCE_AUTO_PARTITION_ID)
-                .setSchemaName(schemaName).setTableName(tableName).build().buildException();
+            case UNABLE_TO_CREATE_CHILD_LINK:
+            case PARENT_TABLE_NOT_FOUND:
+            case TABLE_NOT_IN_REGION:
+                throwsSQLExceptionUtil(String.valueOf(code), schemaName, tableName);
             case TOO_MANY_INDEXES:
-                throw new SQLExceptionInfo.Builder(SQLExceptionCode.TOO_MANY_INDEXES)
-                        .setSchemaName(SchemaUtil.getSchemaNameFromFullName(parent.getPhysicalName().getString()))
-                        .setTableName(SchemaUtil.getTableNameFromFullName(parent.getPhysicalName().getString())).build()
-                        .buildException();
             case UNABLE_TO_UPDATE_PARENT_TABLE:
-                throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNABLE_TO_UPDATE_PARENT_TABLE)
-                        .setSchemaName(SchemaUtil.getSchemaNameFromFullName(parent.getPhysicalName().getString()))
-                        .setTableName(SchemaUtil.getTableNameFromFullName(parent.getPhysicalName().getString())).build()
-                        .buildException();
+                throwsSQLExceptionUtil(String.valueOf(code), SchemaUtil.getSchemaNameFromFullName(
+                parent.getPhysicalName().getString()),SchemaUtil.getTableNameFromFullName(
+                parent.getPhysicalName().getString()));
             default:
-                // If the parent table of the view has the auto partition sequence name attribute,
-                // set the view statement and relevant partition column attributes correctly
-                if (parent!=null && parent.getAutoPartitionSeqName()!=null) {
-                    final PColumn autoPartitionCol = parent.getPKColumns().get(MetaDataUtil.getAutoPartitionColIndex(parent));
-                    final Long autoPartitionNum = Long.valueOf(result.getAutoPartitionNum());
-                    columns.put(autoPartitionCol, new DelegateColumn(autoPartitionCol) {
-                        @Override
-                        public byte[] getViewConstant() {
-                            PDataType dataType = autoPartitionCol.getDataType();
-                            Object val = dataType.toObject(autoPartitionNum, PLong.INSTANCE);
-                            byte[] bytes = new byte [dataType.getByteSize() + 1];
-                            dataType.toBytes(val, bytes, 0);
-                            return bytes;
-                        }
-                        @Override
-                        public boolean isViewReferenced() {
-                            return true;
-                        }
-                    });
-                    String viewPartitionClause = QueryUtil.getViewPartitionClause(MetaDataUtil.getAutoPartitionColumnName(parent), autoPartitionNum);
-                    if (viewStatement!=null) {
-                        viewStatement = viewStatement + " AND " + viewPartitionClause;
-                    }
-                    else {
-                        viewStatement = QueryUtil.getViewStatement(parent.getSchemaName().getString(), parent.getTableName().getString(), viewPartitionClause);
-                    }
-                }
-                PName newSchemaName = PNameFactory.newName(schemaName);
-                /*
-                 * It doesn't hurt for the PTable of views to have the cqCounter. However, views always rely on the
-                 * parent table's counter to dole out encoded column qualifiers. So setting the counter as NULL_COUNTER
-                 * for extra safety.
-                 */
-                EncodedCQCounter cqCounterToBe = tableType == PTableType.VIEW ? NULL_COUNTER : cqCounter;
-                PTable table = new PTableImpl.Builder()
-                        .setType(tableType)
-                        .setState(indexState)
-                        .setTimeStamp(timestamp != null ? timestamp : result.getMutationTime())
-                        .setIndexDisableTimestamp(0L)
-                        .setSequenceNumber(PTable.INITIAL_SEQ_NUM)
-                        .setImmutableRows(isImmutableRows)
-                        .setViewStatement(viewStatement)
-                        .setDisableWAL(Boolean.TRUE.equals(disableWAL))
-                        .setMultiTenant(multiTenant)
-                        .setStoreNulls(storeNulls)
-                        .setViewType(viewType)
-                        .setViewIndexIdType(viewIndexIdType)
-                        .setViewIndexId(result.getViewIndexId())
-                        .setIndexType(indexType)
-                        .setTransactionProvider(transactionProvider)
-                        .setUpdateCacheFrequency(updateCacheFrequency)
-                        .setNamespaceMapped(isNamespaceMapped)
-                        .setAutoPartitionSeqName(autoPartitionSeq)
-                        .setAppendOnlySchema(isAppendOnlySchema)
-                        .setImmutableStorageScheme(immutableStorageScheme == null ?
-                                ImmutableStorageScheme.ONE_CELL_PER_COLUMN : immutableStorageScheme)
-                        .setQualifierEncodingScheme(encodingScheme == null ?
-                                QualifierEncodingScheme.NON_ENCODED_QUALIFIERS : encodingScheme)
-                        .setBaseColumnCount(baseTableColumnCount)
-                        .setEncodedCQCounter(cqCounterToBe)
-                        .setUseStatsForParallelization(useStatsForParallelizationProp)
-                        .setExcludedColumns(ImmutableList.of())
-                        .setTenantId(tenantId)
-                        .setSchemaName(newSchemaName)
-                        .setTableName(PNameFactory.newName(tableName))
-                        .setPkName(pkName == null ? null : PNameFactory.newName(pkName))
-                        .setDefaultFamilyName(defaultFamilyName == null ?
-                                null : PNameFactory.newName(defaultFamilyName))
-                        .setRowKeyOrderOptimizable(rowKeyOrderOptimizable)
-                        .setBucketNum(saltBucketNum)
-                        .setIndexes(Collections.emptyList())
-                        .setParentSchemaName((parent == null) ? null : parent.getSchemaName())
-                        .setParentTableName((parent == null) ? null : parent.getTableName())
-                        .setPhysicalNames(physicalNames == null ?
-                                ImmutableList.of() : ImmutableList.copyOf(physicalNames))
-                        .setColumns(columns.values())
-                        .setViewModifiedUpdateCacheFrequency(tableType ==  PTableType.VIEW &&
-                                parent != null &&
-                                parent.getUpdateCacheFrequency() != updateCacheFrequency)
-                        .setViewModifiedUseStatsForParallelization(tableType ==  PTableType.VIEW &&
-                                parent != null &&
-                                parent.useStatsForParallelization()
-                                        != useStatsForParallelizationProp)
-                        .build();
-                result = new MetaDataMutationResult(code, result.getMutationTime(), table, true);
-                addTableToCache(result);
-                return table;
-            }
-        } finally {
-            connection.setAutoCommit(wasAutoCommit);
-            deleteMutexCells(parentPhysicalSchemaName, parentPhysicalTableName, acquiredColumnMutexSet);
+                // Cannot use SQLExecptionInfo here since not all mutation codes have their
+                // corresponding codes in the enum SQLExceptionCode
+                throw new SQLExceptionInfo.Builder(SQLExceptionCode.UNEXPECTED_MUTATION_CODE)
+                .setSchemaName(schemaName).setTableName(tableName).setMessage("mutation code: "
+                + code).build().buildException();
         }
+    }
+
+    private void throwsSQLExceptionUtil(String code,String schemaName, String tableName)
+            throws SQLException {
+        throw new SQLExceptionInfo.Builder(SQLExceptionCode.valueOf(code))
+                .setSchemaName(schemaName).setTableName(tableName).build().buildException();
     }
 
     private static boolean isPkColumn(PrimaryKeyConstraint pkConstraint, ColumnDef colDef) {
@@ -3229,7 +3406,6 @@ public class MetaDataClient {
                         for (PTable index : table.getIndexes()) {
                             tableRefs.add(new TableRef(null, index, ts, false));
                         }
-                        deleteFromStatsTable(tableRefs, ts);
                     }
                     if (!dropMetaData) {
                         MutationPlan plan = new PostDDLCompiler(connection).compile(tableRefs, null, null,
@@ -3243,32 +3419,6 @@ public class MetaDataClient {
             return new MutationState(0, 0, connection);
         } finally {
             connection.setAutoCommit(wasAutoCommit);
-        }
-    }
-
-    private void deleteFromStatsTable(List<TableRef> tableRefs, long ts) throws SQLException {
-    	boolean isAutoCommit = connection.getAutoCommit();
-    	try {
-	        connection.setAutoCommit(true);
-            StringBuilder buf = new StringBuilder("DELETE FROM SYSTEM.STATS WHERE PHYSICAL_NAME IN (");
-            for (TableRef ref : tableRefs) {
-                buf.append("'" + ref.getTable().getPhysicalName().getString() + "',");
-            }
-            buf.setCharAt(buf.length() - 1, ')');
-            if(tableRefs.get(0).getTable().getIndexType()==IndexType.LOCAL) {
-                buf.append(" AND COLUMN_FAMILY IN(");
-                if (tableRefs.get(0).getTable().getColumnFamilies().isEmpty()) {
-                    buf.append("'" + QueryConstants.DEFAULT_LOCAL_INDEX_COLUMN_FAMILY + "',");
-                } else {
-                    for(PColumnFamily cf : tableRefs.get(0).getTable().getColumnFamilies()) {
-                        buf.append("'" + cf.getName().getString() + "',");
-                    }
-                }
-                buf.setCharAt(buf.length() - 1, ')');
-            }
-            connection.createStatement().execute(buf.toString());
-        } finally {
-        	connection.setAutoCommit(isAutoCommit);
         }
     }
 
@@ -3333,18 +3483,19 @@ public class MetaDataClient {
                 metaPropertiesEvaluated.getGuidePostWidth(),
                 metaPropertiesEvaluated.getAppendOnlySchema(),
                 metaPropertiesEvaluated.getImmutableStorageScheme(),
-                metaPropertiesEvaluated.getUseStatsForParallelization());
+                metaPropertiesEvaluated.getUseStatsForParallelization(),
+                metaPropertiesEvaluated.getPhoenixTTL());
     }
 
-    private  long incrementTableSeqNum(PTable table, PTableType expectedType, int columnCountDelta, Boolean isTransactional, Long updateCacheFrequency) throws SQLException {
-        return incrementTableSeqNum(table, expectedType, columnCountDelta, isTransactional, null, updateCacheFrequency, null, null, null, null, -1L, null, null, null);
+    private  long incrementTableSeqNum(PTable table, PTableType expectedType, int columnCountDelta, Boolean isTransactional, Long updateCacheFrequency, Long phoenixTTL) throws SQLException {
+        return incrementTableSeqNum(table, expectedType, columnCountDelta, isTransactional, null, updateCacheFrequency, null, null, null, null, -1L, null, null, null,phoenixTTL);
     }
 
     private long incrementTableSeqNum(PTable table, PTableType expectedType, int columnCountDelta,
             Boolean isTransactional, TransactionFactory.Provider transactionProvider,
             Long updateCacheFrequency, Boolean isImmutableRows, Boolean disableWAL,
             Boolean isMultiTenant, Boolean storeNulls, Long guidePostWidth, Boolean appendOnlySchema,
-            ImmutableStorageScheme immutableStorageScheme, Boolean useStatsForParallelization)
+            ImmutableStorageScheme immutableStorageScheme, Boolean useStatsForParallelization, Long phoenixTTL)
             throws SQLException {
         String schemaName = table.getSchemaName().getString();
         String tableName = table.getTableName().getString();
@@ -3396,6 +3547,9 @@ public class MetaDataClient {
         }
         if (useStatsForParallelization != null) {
             mutateBooleanProperty(tenantId, schemaName, tableName, USE_STATS_FOR_PARALLELIZATION, useStatsForParallelization);
+        }
+        if (phoenixTTL != null) {
+            mutateLongProperty(tenantId, schemaName, tableName, PHOENIX_TTL, phoenixTTL);
         }
         return seqNum;
     }
@@ -3709,11 +3863,12 @@ public class MetaDataClient {
 
                 if (!table.getIndexes().isEmpty() &&
                         (numPkColumnsAdded>0 || metaProperties.getNonTxToTx() ||
-                                metaPropertiesEvaluated.getUpdateCacheFrequency() != null)) {
+                                metaPropertiesEvaluated.getUpdateCacheFrequency() != null || metaPropertiesEvaluated.getPhoenixTTL() != null)) {
                     for (PTable index : table.getIndexes()) {
                         incrementTableSeqNum(index, index.getType(), numPkColumnsAdded,
                                 metaProperties.getNonTxToTx() ? Boolean.TRUE : null,
-                                metaPropertiesEvaluated.getUpdateCacheFrequency());
+                                metaPropertiesEvaluated.getUpdateCacheFrequency(),
+                                metaPropertiesEvaluated.getPhoenixTTL());
                     }
                     tableMetaData.addAll(connection.getMutationState().toMutations(timeStamp).next().getSecond());
                     connection.rollback();
@@ -4084,7 +4239,7 @@ public class MetaDataClient {
                         }
                     }
                     if(!indexColumnsToDrop.isEmpty()) {
-                        long indexTableSeqNum = incrementTableSeqNum(index, index.getType(), -indexColumnsToDrop.size(), null, null);
+                        long indexTableSeqNum = incrementTableSeqNum(index, index.getType(), -indexColumnsToDrop.size(), null, null, null);
                         dropColumnMutations(index, indexColumnsToDrop);
                         long clientTimestamp = MutationState.getTableTimestamp(timeStamp, connection.getSCN());
                         connection.removeColumn(tenantId, index.getName().getString(),
@@ -4095,7 +4250,7 @@ public class MetaDataClient {
                 tableMetaData.addAll(connection.getMutationState().toMutations(timeStamp).next().getSecond());
                 connection.rollback();
 
-                long seqNum = incrementTableSeqNum(table, statement.getTableType(), -tableColumnsToDrop.size(), null, null);
+                long seqNum = incrementTableSeqNum(table, statement.getTableType(), -tableColumnsToDrop.size(), null, null, null);
                 tableMetaData.addAll(connection.getMutationState().toMutations(timeStamp).next().getSecond());
                 connection.rollback();
                 // Force table header to be first in list
@@ -4374,14 +4529,16 @@ public class MetaDataClient {
                                     tenantId, indexName);
                             if (tasks == null || tasks.size() == 0) {
                                 Timestamp ts = new Timestamp(EnvironmentEdgeManager.currentTimeMillis());
-                                JsonObject jsonObject = new JsonObject();
-                                jsonObject.addProperty(INDEX_NAME, indexName);
-                                jsonObject.addProperty(REBUILD_ALL, true);
+                                Map<String, Object> props = new HashMap<String, Object>() {{
+                                    put(INDEX_NAME, indexName);
+                                    put(REBUILD_ALL, true);
+                                }};
                                 try {
+                                    String json = JacksonUtil.getObjectWriter().writeValueAsString(props);
                                     Task.addTask(connection, PTable.TaskType.INDEX_REBUILD,
                                             tenantId, schemaName,
                                             dataTableName, PTable.TaskStatus.CREATED.toString(),
-                                            jsonObject.toString(), null, ts, null, true);
+                                            json, null, ts, null, true);
                                     connection.commit();
                                 } catch (IOException e) {
                                     throw new SQLException("Exception happened while adding a System.Task" + e.toString());
@@ -4633,9 +4790,11 @@ public class MetaDataClient {
                         metaProperties.setImmutableStorageSchemeProp((ImmutableStorageScheme)value);
                     } else if (propName.equalsIgnoreCase(USE_STATS_FOR_PARALLELIZATION)) {
                         metaProperties.setUseStatsForParallelizationProp((Boolean)value);
+                    } else if (propName.equalsIgnoreCase(PHOENIX_TTL)) {
+                        metaProperties.setPhoenixTTL((Long) value);
                     }
                 }
-                // if removeTableProps is true only add the property if it is not a HTable or Phoenix Table property
+                // if removeTableProps is true only add the property if it is not an HTable or Phoenix Table property
                 if (!removeTableProps || (!TableProperty.isPhoenixTableProperty(propName) && !MetaDataUtil.isHTableProperty(propName))) {
                     propsList.add(prop);
                 }
@@ -4772,6 +4931,20 @@ public class MetaDataClient {
                 metaProperties.setNonTxToTx(true);
             }
         }
+
+        if (metaProperties.getPhoenixTTL() != null) {
+            if (table.getType() != PTableType.VIEW) {
+                throw new SQLExceptionInfo.Builder(
+                        SQLExceptionCode.PHOENIX_TTL_SUPPORTED_FOR_VIEWS_ONLY)
+                        .build()
+                        .buildException();
+            }
+            if (metaProperties.getPhoenixTTL().longValue() != table.getPhoenixTTL()) {
+                metaPropertiesEvaluated.setPhoenixTTL(metaProperties.getPhoenixTTL());
+                changingPhoenixTableProperty = true;
+            }
+        }
+
         return changingPhoenixTableProperty;
     }
 
@@ -4788,6 +4961,7 @@ public class MetaDataClient {
         private ImmutableStorageScheme immutableStorageSchemeProp = null;
         private Boolean useStatsForParallelizationProp = null;
         private boolean nonTxToTx = false;
+        private Long phoenixTTL = null;
 
         public Boolean getImmutableRowsProp() {
             return isImmutableRowsProp;
@@ -4885,6 +5059,10 @@ public class MetaDataClient {
         public void setNonTxToTx(boolean nonTxToTx) {
             this.nonTxToTx = nonTxToTx;
         }
+
+        public Long getPhoenixTTL() { return phoenixTTL; }
+
+        public void setPhoenixTTL(Long phoenixTTL) { this.phoenixTTL = phoenixTTL; }
     }
 
     class MetaPropertiesEvaluated{
@@ -4899,6 +5077,7 @@ public class MetaDataClient {
         private Boolean useStatsForParallelization = null;
         private Boolean isTransactional = null;
         private TransactionFactory.Provider transactionProvider = null;
+        private Long phoenixTTL = null;
 
         public Boolean getIsImmutableRows() {
             return isImmutableRows;
@@ -4987,6 +5166,9 @@ public class MetaDataClient {
         public void setTransactionProvider(TransactionFactory.Provider transactionProvider) {
             this.transactionProvider = transactionProvider;
         }
+        public Long getPhoenixTTL() { return phoenixTTL; }
+
+        public void setPhoenixTTL(Long phoenixTTL) { this.phoenixTTL = phoenixTTL; }
 
     }
 
